@@ -213,7 +213,7 @@ class VidEcxecutor(FFProgress):
             return False
 
     async def _merge_and_rmaudio(self, file_list):
-        streams = await get_metavideo(file_list[0])  # Use first file for stream info
+        streams = await get_metavideo(file_list[0])
         if not streams:
             LOGGER.error(f"No streams found in {file_list[0]}")
             await sendMessage("No streams found in the video file.", self.listener.message)

@@ -11,9 +11,9 @@ class SelectMode:
         self._time = time()
         self._reply = None
         self.listener = listener
-        self.mode = 'merge_rmaudio'  # Auto-set to merge_rmaudio
-        self.newname = ''  # Default output name
-        self.extra_data = {}  # Extra data for flexibility
+        self.mode = 'merge_rmaudio'
+        self.newname = ''
+        self.extra_data = {}
         self.is_cancelled = False
         LOGGER.info(f"Initialized SelectMode for user {self.listener.user_id}, isLink: {isLink}, mode auto-set to merge_rmaudio")
 

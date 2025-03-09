@@ -107,7 +107,6 @@ class VidEcxecutor(FFProgress):
         return file_list
 
     async def _queue(self):
-        # Adapted from parent project to serialize tasks
         add_to_queue, event = await task.check_running_tasks(self.listener.mid)
         if add_to_queue:
             LOGGER.info(f"Added to Queue/Download: MID {self.listener.mid}")
@@ -124,7 +123,6 @@ class VidEcxecutor(FFProgress):
         async with queue_dict_lock:
             non_queued_dl.add(self.listener.mid)
 
-        # Run execution and trigger upload
         result = await self._execute_task()
         if result and not self.is_cancelled:
             await self.listener.onUpload(result)
@@ -135,7 +133,6 @@ class VidEcxecutor(FFProgress):
         return result
 
     async def _execute_task(self):
-        # Core execution logic moved here from execute
         self._is_dir = await aiopath.isdir(self.path)
         try:
             self.mode, self.name, kwargs = self.listener.vidMode
@@ -167,7 +164,6 @@ class VidEcxecutor(FFProgress):
             return None
 
     async def execute(self):
-        # Now just triggers queuing
         return await self._queue()
 
     @new_task

@@ -89,13 +89,6 @@ class SelectMode:
             modes = {
                 'merge_rmaudio': 'Merge & Remove Audio',
                 'merge_preremove_audio': 'Merge Pre-Remove Audio',
-                'vid_vid': 'Merge Videos',
-                'vid_aud': 'Merge Audio',
-                'vid_sub': 'Merge Subtitles',
-                'trim': 'Trim Video',
-                'watermark': 'Add Watermark',
-                'compress': 'Compress Video',
-                'rmstream': 'Remove Streams',
                 'convert': 'Convert Resolution'
             }
             if not self._isLink:

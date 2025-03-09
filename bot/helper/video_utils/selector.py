@@ -1,9 +1,7 @@
 from __future__ import annotations
-from asyncio import gather
 from time import time
 
-from bot import config_dict, VID_MODE, LOGGER
-from bot.helper.ext_utils.bot_utils import new_thread
+from bot import VID_MODE, LOGGER
 from bot.helper.listeners import tasks_listener as task
 from bot.helper.telegram_helper.message_utils import sendMessage, deleteMessage
 
@@ -13,9 +11,9 @@ class SelectMode:
         self._time = time()
         self._reply = None
         self.listener = listener
-        self.mode = 'merge_rmaudio'
-        self.newname = ''
-        self.extra_data = {}
+        self.mode = 'merge_rmaudio'  # Auto-set to merge_rmaudio
+        self.newname = ''  # Default output name
+        self.extra_data = {}  # Extra data for flexibility
         self.is_cancelled = False
         LOGGER.info(f"Initialized SelectMode for user {self.listener.user_id}, isLink: {isLink}, mode auto-set to merge_rmaudio")
 
@@ -26,12 +24,12 @@ class SelectMode:
                 LOGGER.info(f"Sent message for mode confirmation to user {self.listener.user_id}")
         except Exception as e:
             LOGGER.error(f"Failed to send message: {e}")
+            self.is_cancelled = True
 
     def _captions(self):
-        msg = (f'<b>VIDEO TOOLS SETTINGS</b>\n'
-               f'Mode: <b>{VID_MODE.get(self.mode, "Not Selected")}</b>\n'
-               f'Output Name: <b>{self.newname or "Default"}</b>')
-        return msg
+        return (f'<b>VIDEO TOOLS SETTINGS</b>\n'
+                f'Mode: <b>{VID_MODE.get(self.mode, "Not Selected")}</b>\n'
+                f'Output Name: <b>{self.newname or "Default"}</b>')
 
     async def list_buttons(self):
         await self._send_message(self._captions())

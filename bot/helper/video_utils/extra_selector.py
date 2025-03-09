@@ -47,7 +47,7 @@ class ExtraSelect:
             LOGGER.info(f"Initializing stream data for {self.executor.mode}")
             self.executor.data = {'streams': {}, 'streams_to_remove': []}
             for stream in streams:
-                if isinstance(stream, dict) and stream.get('codec_type') in ['video', 'audio', 'subtitle', 'data']:
+                if isinstance(stream, dict) and 'codec_type' in stream:
                     index = stream['index']
                     self.executor.data['streams'][index] = stream
                     self.executor.data['streams'][index]['info'] = self._format_stream_name(stream)
@@ -62,27 +62,23 @@ class ExtraSelect:
                 f'Size: <b>{get_readable_file_size(self.executor.size)}</b>\n'
                 f'\n<b>Streams:</b>\n')
 
-        # Check for Telugu audio streams
         has_telugu_audio = any(
             stream.get('codec_type') == 'audio' and self._is_telugu(stream.get('tags', {}).get('language', ''))
             for stream in streams_dict.values()
         )
 
-        # Auto-select logic
         for key, value in streams_dict.items():
             codec_type = value.get('codec_type', 'unknown')
             lang = value.get('tags', {}).get('language', '')
             is_metadata = codec_type == 'data' or (codec_type == 'unknown' and 'metadata' in value.get('tags', {}).get('title', '').lower())
 
             if has_telugu_audio:
-                # If Telugu audio exists, keep only Telugu audio, video, and metadata
                 if (codec_type == 'audio' and self._is_telugu(lang)) or codec_type == 'video' or is_metadata:
                     text += f"{value['info']}\n"
                 else:
                     self.executor.data['streams_to_remove'].append(key)
                     text += f"🚫 {value['info']} (Removed)\n"
             else:
-                # If no Telugu audio, keep all audio (including untagged), video, and metadata; remove subtitles
                 if codec_type in ['audio', 'video'] or is_metadata:
                     text += f"{value['info']}\n"
                 else:
@@ -116,4 +112,4 @@ class ExtraSelect:
             await self._listener.onUploadError(f'{VID_MODE[self.executor.mode]} stopped due to error!')
         else:
             LOGGER.info(f"Selections completed: {self.executor.data}")
-            self.executor.event.set()  # Sync with VidEcxecutor
+            self.executor.event.set()

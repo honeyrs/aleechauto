@@ -1,14 +1,15 @@
 from __future__ import annotations
 from aiofiles import open as aiopen
-from aiofiles.os import path as aiopath, makedirs, listdir
+from aiofiles.os import path as aiopath, makedirs
 from aioshutil import rmtree
+from ast import literal_eval
 from asyncio import create_subprocess_exec, gather, Event, wait_for
 from asyncio.subprocess import PIPE
 from natsort import natsorted
 from os import path as ospath, walk
 from time import time
 
-from bot import config_dict, task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME
+from bot import task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME
 from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec, new_task
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target
 from bot.helper.ext_utils.media_utils import get_document_type, FFProgress
@@ -212,16 +213,11 @@ class VidEcxecutor(FFProgress):
             return False
 
     async def _merge_and_rmaudio(self, file_list):
-        if len(file_list) == 1:
-            self.path = file_list[0]
-            # Single file case could use a separate method, but we'll handle it here for simplicity
-            streams = await get_metavideo(file_list[0])
-            if not streams:
-                LOGGER.error(f"No streams found in {file_list[0]}")
-                await sendMessage("No streams found.", self.listener.message)
-                return None
-        else:
-            streams = await get_metavideo(file_list[0])  # Use first file for stream info
+        streams = await get_metavideo(file_list[0])  # Use first file for stream info
+        if not streams:
+            LOGGER.error(f"No streams found in {file_list[0]}")
+            await sendMessage("No streams found in the video file.", self.listener.message)
+            return None
 
         base_dir = await self._name_base_dir(file_list[0], 'Merge-RemoveAudio', multi=len(file_list) > 1)
         self._files = file_list
@@ -245,9 +241,7 @@ class VidEcxecutor(FFProgress):
             else:
                 cmd = [FFMPEG_NAME, '-i', file_list[0]]
 
-            # Map video streams
             cmd.extend(['-map', '0:v'])
-            # Map kept streams (audio/metadata)
             kept_streams = [f'0:{s["index"]}' for s in streams if s['index'] not in streams_to_remove and s['codec_type'] != 'video']
             for stream in kept_streams:
                 cmd.extend(['-map', stream])

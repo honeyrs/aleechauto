@@ -40,8 +40,8 @@ class SelectMode:
         try:
             await self.list_buttons()
             await deleteMessage(self._reply)
-            executor = VidEcxecutor(self.listener, self.listener.upPath, self.listener.gid)  # Assumes upPath and gid from listener
-            await executor._queue()  # Queue the task instead of running it
+            executor = VidEcxecutor(self.listener, self.listener.dir, self.listener.gid)  # Fixed: use dir instead of upPath
+            await executor._queue()  # Queue the task
             LOGGER.info(f"Queued VidEcxecutor for MID: {self.listener.mid}")
             return [self.mode, self.newname, self.extra_data]
         except Exception as e:

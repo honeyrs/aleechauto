@@ -40,10 +40,12 @@ class SelectMode:
         try:
             await self.list_buttons()
             await deleteMessage(self._reply)
-            executor = VidEcxecutor(self.listener, self.listener.dir, self.listener.mid)  # Fixed: use mid instead of gid
+            # Set vidMode before queuing to avoid NoneType error
+            self.listener.vidMode = [self.mode, self.newname, self.extra_data]
+            executor = VidEcxecutor(self.listener, self.listener.dir, self.listener.mid)
             await executor._queue()  # Queue the task
             LOGGER.info(f"Queued VidEcxecutor for MID: {self.listener.mid}")
-            return [self.mode, self.newname, self.extra_data]
+            return self.listener.vidMode
         except Exception as e:
             LOGGER.error(f"Error in get_buttons: {e}", exc_info=True)
             self.is_cancelled = True

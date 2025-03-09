@@ -124,12 +124,10 @@ class VidEcxecutor(FFProgress):
             non_queued_dl.add(self.listener.mid)
 
         result = await self._execute_task()
-        if result and not self.is_cancelled:
-            await self.listener.onUpload(result)
-        elif self.is_cancelled:
-            await self.listener.onUploadError("Task cancelled.")
-        else:
-            await self.listener.onUploadError(f"{self.mode} processing failed.")
+        if not result:
+            LOGGER.error(f"Task failed or cancelled for MID: {self.listener.mid}")
+        async with queue_dict_lock:
+            non_queued_dl.discard(self.listener.mid)
         return result
 
     async def _execute_task(self):

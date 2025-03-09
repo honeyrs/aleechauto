@@ -40,12 +40,11 @@ class SelectMode:
         try:
             await self.list_buttons()
             await deleteMessage(self._reply)
-            # Set vidMode before queuing to avoid NoneType error
             self.listener.vidMode = [self.mode, self.newname, self.extra_data]
             executor = VidEcxecutor(self.listener, self.listener.dir, self.listener.mid)
-            await executor._queue()  # Queue the task
+            result = await executor._queue()  # Get the final path
             LOGGER.info(f"Queued VidEcxecutor for MID: {self.listener.mid}")
-            return self.listener.vidMode
+            return result if result else None  # Return path or None
         except Exception as e:
             LOGGER.error(f"Error in get_buttons: {e}", exc_info=True)
             self.is_cancelled = True

@@ -9,13 +9,12 @@ from natsort import natsorted
 from os import path as ospath, walk
 from time import time
 
-from bot import task_dict, task_dict_lock, queue_dict_lock, non_queued_dl, LOGGER, VID_MODE, FFMPEG_NAME
+from bot import task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME
 from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec, new_task
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target
 from bot.helper.ext_utils.media_utils import get_document_type, FFProgress
 from bot.helper.listeners import tasks_listener as task
 from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
-from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
 from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendMessage
 
 async def get_metavideo(video_file):
@@ -106,37 +105,14 @@ class VidEcxecutor(FFProgress):
         self.size = sum(await gather(*[get_path_size(f) for f in file_list])) if file_list else 0
         return file_list
 
-    async def _queue(self):
-        add_to_queue, event = await task.check_running_tasks(self.listener.mid)
-        if add_to_queue:
-            LOGGER.info(f"Added to Queue/Download: MID {self.listener.mid}")
-            async with task_dict_lock:
-                task_dict[self.listener.mid] = QueueStatus(self.listener, self.size, self._gid, 'dl')
-            await self.listener.onDownloadStart()
-            await sendStatusMessage(self.listener.message)
-            await event.wait()
-            async with task_dict_lock:
-                if self.listener.mid not in task_dict:
-                    self.is_cancelled = True
-                    LOGGER.info(f"Task cancelled during queue wait: MID {self.listener.mid}")
-                    return None
-        async with queue_dict_lock:
-            non_queued_dl.add(self.listener.mid)
-
-        result = await self._execute_task()
-        if not result:
-            LOGGER.error(f"Task failed or cancelled for MID: {self.listener.mid}")
-        async with queue_dict_lock:
-            non_queued_dl.discard(self.listener.mid)
-        return result
-
-    async def _execute_task(self):
+    async def execute(self):
         self._is_dir = await aiopath.isdir(self.path)
         try:
             self.mode, self.name, kwargs = self.listener.vidMode
         except AttributeError as e:
             LOGGER.error(f"Invalid vidMode: {e}")
             await self._cleanup()
+            await self.listener.onUploadError("Invalid video mode configuration.")
             return None
 
         LOGGER.info(f"Executing {self.mode} with name: {self.name}")
@@ -154,15 +130,14 @@ class VidEcxecutor(FFProgress):
                 result = None
             if self.is_cancelled or not result:
                 await self._cleanup()
+                await self.listener.onUploadError(f"{self.mode} processing failed.")
                 return None
             return result
         except Exception as e:
             LOGGER.error(f"Execution error in {self.mode}: {e}", exc_info=True)
             await self._cleanup()
+            await self._listener.onUploadError(f"Failed to process {self.mode}.")
             return None
-
-    async def execute(self):
-        return await self._queue()
 
     @new_task
     async def _start_handler(self, *args):

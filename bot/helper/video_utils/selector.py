@@ -4,7 +4,6 @@ from time import time
 from bot import VID_MODE, LOGGER
 from bot.helper.listeners import tasks_listener as task
 from bot.helper.telegram_helper.message_utils import sendMessage, deleteMessage
-from bot.helper.video_utils.executor import VidEcxecutor
 
 class SelectMode:
     def __init__(self, listener: task.TaskListener, isLink=False):
@@ -40,11 +39,8 @@ class SelectMode:
         try:
             await self.list_buttons()
             await deleteMessage(self._reply)
-            self.listener.vidMode = [self.mode, self.newname, self.extra_data]
-            executor = VidEcxecutor(self.listener, self.listener.dir, self.listener.mid)
-            result = await executor._queue()  # Get the final path
-            LOGGER.info(f"Queued VidEcxecutor for MID: {self.listener.mid}")
-            return result if result else None  # Return path or None
+            LOGGER.info(f"Mode auto-continued: {self.mode}, name: {self.newname}, extra: {self.extra_data}")
+            return [self.mode, self.newname, self.extra_data]
         except Exception as e:
             LOGGER.error(f"Error in get_buttons: {e}", exc_info=True)
             self.is_cancelled = True

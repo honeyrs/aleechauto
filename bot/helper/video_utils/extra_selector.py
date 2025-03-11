@@ -6,7 +6,7 @@ from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
 from bot.helper.telegram_helper.bot_commands import BotCommands
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import editMessage, sendMessage
-from bot.helper.video_utils.executor import get_metavideo  # Added import
+from bot.helper.video_utils.executor import get_metavideo
 
 class ExtraSelect:
     def __init__(self, executor):
@@ -15,7 +15,6 @@ class ExtraSelect:
 
     @new_task
     async def get_buttons(self, streams):
-        """Displays stream selection UI."""
         buttons = ButtonMaker()
         msg = "**Select streams to keep:**\n"
         SUPPORTED_LANGUAGES = config_dict.get('SUPPORTED_LANGUAGES', ['eng']).copy()
@@ -51,7 +50,6 @@ class ExtraSelect:
         await sendMessage(msg, self.executor.listener.message, buttons.build_menu(2))
 
     async def update_streams(self, mode, index):
-        """Updates selected streams based on user input."""
         LOGGER.debug(f"Updating streams: {mode} {index}")
         if mode == 'keep':
             self.streams_select.append(int(index))
@@ -63,7 +61,6 @@ class ExtraSelect:
         await sendStatusMessage(self.executor.listener.message)
 
     async def finish_selection(self):
-        """Finalizes stream selection and signals completion."""
         LOGGER.info(f"Finished stream selection: Keeping streams {self.streams_select}")
         streams = await get_metavideo(self.executor.path if self.executor._metadata else self.executor._files[0])
         self.executor.data['streams_to_remove'] = [s['index'] for s in streams if s['index'] not in self.streams_select and s['codec_type'] != 'video']

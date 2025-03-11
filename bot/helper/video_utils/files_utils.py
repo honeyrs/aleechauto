@@ -6,7 +6,6 @@ from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec
 from aioshutil import rmtree
 
 async def split_file(path, size):
-    """Splits a file into parts smaller than the specified size."""
     LOGGER.info(f"Splitting file: {path} with size limit: {size}")
     if not await sync_to_async(os.path.isfile, path):
         LOGGER.error(f"Cannot split {path}: not a file")
@@ -25,7 +24,6 @@ async def split_file(path, size):
     return parts
 
 async def createThumb(path):
-    """Creates a thumbnail from a video file."""
     LOGGER.info(f"Creating thumbnail for: {path}")
     output = os.path.splitext(path)[0] + "_thumb.jpg"
     cmd = ['ffmpeg', '-i', path, '-vf', 'thumbnail', '-frames:v', '1', output, '-y']
@@ -38,7 +36,6 @@ async def createThumb(path):
     return None
 
 async def get_path_size(path):
-    """Calculates total size of a path (file or directory)."""
     if await sync_to_async(os.path.isfile, path):
         return await sync_to_async(os.path.getsize, path)
     total_size = 0
@@ -50,7 +47,6 @@ async def get_path_size(path):
     return total_size
 
 async def clean_target(path):
-    """Removes a file or directory."""
     try:
         if await sync_to_async(os.path.isfile, path):
             await sync_to_async(os.remove, path)

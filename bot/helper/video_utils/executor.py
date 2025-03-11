@@ -15,7 +15,6 @@ from bot.helper.ext_utils.media_utils import get_document_type, FFProgress
 from bot.helper.listeners import tasks_listener as task
 from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
 from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendMessage
-from bot.helper.video_utils.extra_selector import ExtraSelect
 from bot.helper.video_utils.task_coordinator import TaskCoordinator
 
 async def get_metavideo(video_file):
@@ -49,7 +48,6 @@ class VidEcxecutor(FFProgress):
         LOGGER.info(f"Initialized VidEcxecutor for MID: {self.listener.mid}, path: {self.path}")
 
     async def _cleanup(self):
-        """Cleans up temporary files and resets state."""
         try:
             for f in self._files:
                 if await aiopath.exists(f):
@@ -65,7 +63,6 @@ class VidEcxecutor(FFProgress):
             LOGGER.error(f"Cleanup error: {e}")
 
     async def _extract_zip(self, zip_path):
-        """Extracts ZIP/RAR archives using 7z."""
         extract_dir = ospath.join(ospath.dirname(zip_path), f"extracted_{self._gid}")
         try:
             await makedirs(extract_dir, exist_ok=True)
@@ -84,7 +81,6 @@ class VidEcxecutor(FFProgress):
             return None
 
     async def _get_files(self):
-        """Collects media files from path or archive."""
         file_list = []
         if self._metadata:
             file_list.append(self.path)
@@ -112,7 +108,6 @@ class VidEcxecutor(FFProgress):
         return file_list
 
     async def execute(self):
-        """Executes video processing based on mode."""
         self._is_dir = await aiopath.isdir(self.path)
         try:
             self.mode, self.name, kwargs = self.listener.vidMode
@@ -154,12 +149,11 @@ class VidEcxecutor(FFProgress):
 
     @new_task
     async def _start_handler(self, *args):
-        """Initiates stream selection."""
+        from bot.helper.video_utils.extra_selector import ExtraSelect  # Moved import here
         selector = ExtraSelect(self)
         await selector.get_buttons(*args)
 
     async def _send_status(self, status='wait'):
-        """Sends status update to Telegram."""
         try:
             async with task_dict_lock:
                 task_dict[self.listener.mid] = FFMpegStatus(self.listener, self, self._gid, status)
@@ -169,7 +163,6 @@ class VidEcxecutor(FFProgress):
             LOGGER.error(f"Failed to send status: {e}")
 
     async def _final_path(self, outfile=''):
-        """Determines final output path and cleans up extras."""
         try:
             if self._metadata:
                 self._up_path = outfile or self.outfile
@@ -191,7 +184,6 @@ class VidEcxecutor(FFProgress):
             return None
 
     async def _name_base_dir(self, path, info: str=None, multi: bool=False):
-        """Generates output name and base directory."""
         base_dir, file_name = ospath.split(path)
         if not self.name or multi:
             if info:
@@ -206,7 +198,6 @@ class VidEcxecutor(FFProgress):
         return base_dir if await aiopath.isfile(path) else path
 
     async def _run_cmd(self, cmd, status='prog'):
-        """Runs FFmpeg command with progress tracking."""
         try:
             await self._send_status(status)
             LOGGER.info(f"Running FFmpeg cmd: {' '.join(cmd)}")
@@ -230,7 +221,6 @@ class VidEcxecutor(FFProgress):
             return False
 
     async def _merge_and_rmaudio(self, file_list):
-        """Merges files and removes unwanted audio streams."""
         streams = await get_metavideo(file_list[0]) if file_list else []
         if not streams and file_list:
             LOGGER.warning(f"No streams found in {file_list[0]}, proceeding with defaults")

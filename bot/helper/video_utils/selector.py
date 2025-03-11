@@ -10,9 +10,8 @@ class SelectMode:
         self.extra_data = {}
 
     async def get_buttons(self):
-        """Displays mode selection UI."""
         buttons = ButtonMaker()
-        self.mode = 'merge_rmaudio'  # Hardcoded as per your original
+        self.mode = 'merge_rmaudio'
         msg = f"Selected mode: **{VID_MODE.get(self.mode, self.mode)}**\nEnter new name (or leave blank for default):"
         buttons.cb_buildbutton("Confirm", f"vidmode {self.listener.mid} confirm")
         buttons.cb_buildbutton("Cancel", f"vidmode {self.listener.mid} cancel")
@@ -20,7 +19,6 @@ class SelectMode:
         await sendMessage(msg, self.listener.message, buttons.build_menu(1))
 
     async def set_values(self, newname):
-        """Sets mode values based on user input."""
         LOGGER.info(f"Setting mode values: mode={self.mode}, newname={newname}")
         self.newname = newname.strip() if newname.strip() else ''
         return [self.mode, self.newname, self.extra_data]

@@ -17,7 +17,9 @@ async def split_file(path, size):
     process = await create_subprocess_exec(*cmd, stderr=PIPE)
     await process.wait()
     if process.returncode != 0:
-        LOGGER.error(f"Split failed for {path}: {(await process.stderr.read()).decode()}")
+        LOGGER.error(f"Split failed for {path}: {(
+
+await process.stderr.read()).decode()}")
         return [path]
     parts = [f'{path}.split-{i:03d}.mkv' for i in range(1000) if await sync_to_async(os.path.exists, f'{path}.split-{i:03d}.mkv')]
     LOGGER.info(f"Split {path} into {len(parts)} parts")

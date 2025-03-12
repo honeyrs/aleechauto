@@ -3,11 +3,12 @@ from aiofiles import open as aiopen
 from aiofiles.os import path as aiopath, makedirs
 from aioshutil import rmtree
 from ast import literal_eval
-from asyncio import create_subprocess_exec, gather, Event, Semaphore, wait_for, TimeoutError
+from asyncio import create_subprocess_exec, gather, Event, Semaphore, TimeoutError
 from asyncio.subprocess import PIPE
 from natsort import natsorted
 from os import path as ospath, walk
 from time import time
+
 from bot import task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME, bot
 from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec, new_task
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target
@@ -116,7 +117,9 @@ class VidEcxecutor(FFProgress):
                     progress=self._upload_progress,
                     reply_to_message_id=self.listener.message.id
                 )
-                await wait_for(self._send_msg.wait(), timeout=600)
+                # No wait() needed; send_document is already async and completes here
+                if not self._send_msg or not hasattr(self._send_msg, 'link'):
+                    raise ValueError("Upload failed: No valid message returned")
                 LOGGER.info(f"Upload completed for MID: {self.listener.mid}: {file_path}")
                 return self._send_msg.link
             except TimeoutError:
@@ -145,6 +148,7 @@ class VidEcxecutor(FFProgress):
         if not file_list:
             await sendMessage("No valid video files found.", self.listener.message)
             await self._cleanup()
+            await self.listener.onUploadError("No files to process or upload.")
             return None
 
         try:
@@ -155,6 +159,8 @@ class VidEcxecutor(FFProgress):
                     if uploaded_link:
                         await self.listener.onUploadComplete(uploaded_link, self.size, {uploaded_link: self.name}, 1, 0)
                     else:
+                        await self._cleanup()
+                        await self.listener.onUploadError("Upload failed after processing.")
                         return None
             else:
                 LOGGER.error(f"Unsupported mode: {self.mode}")
@@ -286,7 +292,9 @@ class VidEcxecutor(FFProgress):
             kept_streams = [f'0:{s["index"]}' for s in streams if s['index'] not in streams_to_remove and s['codec_type'] != 'video']
             for stream in kept_streams:
                 cmd.extend(['-map', stream])
-            cmd.extend(['-c', 'copy', self.outfile, '-y'])
+            cmd.extend(['-c', 'copy',
+
+ self.outfile, '-y'])
 
             if not await self._run_cmd(cmd, 'direct'):
                 await sendMessage("Merging failed due to FFmpeg error.", self.listener.message)

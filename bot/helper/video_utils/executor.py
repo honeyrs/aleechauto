@@ -3,11 +3,10 @@ from aiofiles import open as aiopen
 from aiofiles.os import path as aiopath, makedirs
 from aioshutil import rmtree
 from ast import literal_eval
-from asyncio import create_subprocess_exec, gather, Event, wait_for
+from asyncio import create_subprocess_exec, gather, Event, Semaphore, wait_for, TimeoutError
 from asyncio.subprocess import PIPE
 from natsort import natsorted
 from os import path as ospath, walk
-from time import time
 
 from bot import task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME
 from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec, new_task
@@ -16,6 +15,9 @@ from bot.helper.ext_utils.media_utils import get_document_type, FFProgress
 from bot.helper.listeners import tasks_listener as task
 from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
 from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendMessage
+
+# Global semaphore for upload concurrency
+UPLOAD_SEMAPHORE = Semaphore(3)
 
 async def get_metavideo(video_file):
     try:
@@ -44,6 +46,8 @@ class VidEcxecutor(FFProgress):
         self._gid = gid
         self._files = []
         self.is_cancelled = False
+        self._processed_bytes = 0
+        self._last_uploaded = 0
         LOGGER.info(f"Initialized VidEcxecutor for MID: {self.listener.mid}, path: {self.path}")
 
     async def _cleanup(self):
@@ -57,26 +61,9 @@ class VidEcxecutor(FFProgress):
                 await clean_target(input_file)
             self.data.clear()
             self.is_cancelled = True
-            LOGGER.info(f"Cleanup completed for {self.mode}")
+            LOGGER.info(f"Cleanup completed for MID: {self.listener.mid}")
         except Exception as e:
             LOGGER.error(f"Cleanup error: {e}")
-
-    async def _extract_zip(self, zip_path):
-        extract_dir = ospath.join(ospath.dirname(zip_path), f"extracted_{self._gid}")
-        try:
-            await makedirs(extract_dir, exist_ok=True)
-            cmd = ['7z', 'x', zip_path, f'-o{extract_dir}', '-y']
-            _, stderr, rcode = await cmd_exec(cmd)
-            if rcode != 0:
-                LOGGER.error(f"Failed to extract ZIP: {stderr}")
-                await rmtree(extract_dir, ignore_errors=True)
-                return None
-            LOGGER.info(f"Extracted ZIP to {extract_dir}")
-            return extract_dir
-        except Exception as e:
-            LOGGER.error(f"ZIP extraction error: {e}")
-            await rmtree(extract_dir, ignore_errors=True)
-            return None
 
     async def _get_files(self):
         file_list = []
@@ -84,15 +71,20 @@ class VidEcxecutor(FFProgress):
             file_list.append(self.path)
         elif await aiopath.isfile(self.path):
             if self.path.lower().endswith('.zip'):
-                extract_dir = await self._extract_zip(self.path)
-                if extract_dir:
-                    self._files.append(extract_dir)
-                    for dirpath, _, files in await sync_to_async(walk, extract_dir):
-                        for file in natsorted(files):
-                            file_path = ospath.join(dirpath, file)
-                            if (await get_document_type(file_path))[0]:
-                                file_list.append(file_path)
-                                LOGGER.info(f"Found media file: {file_path}")
+                extract_dir = ospath.join(ospath.dirname(self.path), f"extracted_{self._gid}")
+                await makedirs(extract_dir, exist_ok=True)
+                cmd = ['7z', 'x', self.path, f'-o{extract_dir}', '-y']
+                _, stderr, rcode = await cmd_exec(cmd)
+                if rcode != 0:
+                    LOGGER.error(f"Failed to extract ZIP: {stderr}")
+                    await rmtree(extract_dir, ignore_errors=True)
+                    return None
+                self._files.append(extract_dir)
+                for dirpath, _, files in await sync_to_async(walk, extract_dir):
+                    for file in natsorted(files):
+                        file_path = ospath.join(dirpath, file)
+                        if (await get_document_type(file_path))[0]:
+                            file_list.append(file_path)
             elif (await get_document_type(self.path))[0]:
                 file_list.append(self.path)
         else:
@@ -101,9 +93,30 @@ class VidEcxecutor(FFProgress):
                     file_path = ospath.join(dirpath, file)
                     if (await get_document_type(file_path))[0]:
                         file_list.append(file_path)
-                        LOGGER.info(f"Found media file: {file_path}")
         self.size = sum(await gather(*[get_path_size(f) for f in file_list])) if file_list else 0
         return file_list
+
+    async def _upload_progress(self, current, _):
+        if self.is_cancelled:
+            raise Exception("Upload cancelled")
+        chunk_size = current - self._last_uploaded
+        self._last_uploaded = current
+        self._processed_bytes += chunk_size
+
+    async def _upload_file(self, file_path):
+        async with UPLOAD_SEMAPHORE:
+            try:
+                LOGGER.info(f"Uploading file for MID: {self.listener.mid}: {file_path}")
+                # Placeholder for actual upload logic (e.g., Telegram API call)
+                # Replace with bot.send_document or similar from TgUploader
+                await wait_for(sendMessage(f"Uploading {file_path}", self.listener.message), timeout=600)
+                LOGGER.info(f"Upload completed for MID: {self.listener.mid}: {file_path}")
+                return file_path
+            except TimeoutError:
+                LOGGER.error(f"Upload timed out for MID: {self.listener.mid}: {file_path}")
+                self.is_cancelled = True
+                await self.listener.onUploadError("Upload timed out after 10 minutes")
+                return None
 
     async def execute(self):
         self._is_dir = await aiopath.isdir(self.path)
@@ -115,7 +128,7 @@ class VidEcxecutor(FFProgress):
             await self.listener.onUploadError("Invalid video mode configuration.")
             return None
 
-        LOGGER.info(f"Executing {self.mode} with name: {self.name}")
+        LOGGER.info(f"Executing {self.mode} for MID: {self.listener.mid}")
         file_list = await self._get_files()
         if not file_list:
             await sendMessage("No valid video files found.", self.listener.message)
@@ -125,6 +138,12 @@ class VidEcxecutor(FFProgress):
         try:
             if self.mode == 'merge_rmaudio':
                 result = await self._merge_and_rmaudio(file_list)
+                if result and not self.is_cancelled:
+                    uploaded_file = await self._upload_file(result)
+                    if uploaded_file:
+                        await self.listener.onUploadComplete(uploaded_file, self.size, {}, 1, 0)
+                    else:
+                        return None
             else:
                 LOGGER.error(f"Unsupported mode: {self.mode}")
                 result = None
@@ -136,8 +155,12 @@ class VidEcxecutor(FFProgress):
         except Exception as e:
             LOGGER.error(f"Execution error in {self.mode}: {e}", exc_info=True)
             await self._cleanup()
-            await self._listener.onUploadError(f"Failed to process {self.mode}.")
+            await self.listener.onUploadError(f"Failed to process {self.mode}.")
             return None
+        finally:
+            async with task_dict_lock:
+                task_dict.pop(self.listener.mid, None)
+            LOGGER.info(f"Task {self.listener.mid} removed from task_dict")
 
     @new_task
     async def _start_handler(self, *args):
@@ -150,7 +173,7 @@ class VidEcxecutor(FFProgress):
             async with task_dict_lock:
                 task_dict[self.listener.mid] = FFMpegStatus(self.listener, self, self._gid, status)
             await sendStatusMessage(self.listener.message)
-            LOGGER.info(f"Sent status update: {status}")
+            LOGGER.info(f"Sent status update: {status} for MID: {self.listener.mid}")
         except Exception as e:
             LOGGER.error(f"Failed to send status: {e}")
 
@@ -168,7 +191,7 @@ class VidEcxecutor(FFProgress):
                 if len(all_files) == 1:
                     self._up_path = ospath.join(*all_files[0])
             self._files.clear()
-            LOGGER.info(f"Final path: {self._up_path}")
+            LOGGER.info(f"Final path for MID: {self.listener.mid}: {self._up_path}")
             return self._up_path
         except Exception as e:
             LOGGER.error(f"Final path error: {e}")
@@ -182,29 +205,27 @@ class VidEcxecutor(FFProgress):
                 if await aiopath.isfile(path):
                     file_name = file_name.rsplit('.', 1)[0]
                 file_name += f'_{info}.mkv'
-                LOGGER.info(f"Generated name: {file_name}")
             self.name = file_name
         if not self.name.upper().endswith(('MKV', 'MP4')):
             self.name += '.mkv'
-        LOGGER.info(f"Set name: {self.name} with base_dir: {base_dir}")
         return base_dir if await aiopath.isfile(path) else path
 
     async def _run_cmd(self, cmd, status='prog'):
         try:
             await self._send_status(status)
-            LOGGER.info(f"Running FFmpeg cmd: {' '.join(cmd)}")
+            LOGGER.info(f"Running FFmpeg cmd for MID: {self.listener.mid}: {' '.join(cmd)}")
             process = await create_subprocess_exec(*cmd, stderr=PIPE)
             self.listener.suproc = process
             _, code = await gather(self.progress(status), process.wait())
             if code == 0:
-                LOGGER.info("FFmpeg succeeded")
+                LOGGER.info(f"FFmpeg succeeded for MID: {self.listener.mid}")
                 return True
             if self.listener.suproc == 'cancelled' or code == -9:
                 self.is_cancelled = True
-                LOGGER.info("FFmpeg cancelled")
+                LOGGER.info(f"FFmpeg cancelled for MID: {self.listener.mid}")
             else:
                 error_msg = (await process.stderr.read()).decode().strip()
-                LOGGER.error(f"FFmpeg error: {error_msg}")
+                LOGGER.error(f"FFmpeg error for MID: {self.listener.mid}: {error_msg}")
                 self.is_cancelled = True
             return False
         except Exception as e:
@@ -215,7 +236,7 @@ class VidEcxecutor(FFProgress):
     async def _merge_and_rmaudio(self, file_list):
         streams = await get_metavideo(file_list[0])
         if not streams:
-            LOGGER.error(f"No streams found in {file_list[0]}")
+            LOGGER.error(f"No streams found in {file_list[0]} for MID: {self.listener.mid}")
             await sendMessage("No streams found in the video file.", self.listener.message)
             return None
 
@@ -224,9 +245,17 @@ class VidEcxecutor(FFProgress):
         self.size = sum(await gather(*[get_path_size(f) for f in file_list])) if file_list else 0
 
         await self._start_handler(streams)
-        await wait_for(self.event.wait(), timeout=180)
+        try:
+            await wait_for(self.event.wait(), timeout=180)
+        except TimeoutError:
+            LOGGER.error(f"Stream selection timed out for MID: {self.listener.mid}")
+            self.is_cancelled = True
+            await self._cleanup()
+            await self.listener.onUploadError("Stream selection timed out after 180 seconds.")
+            return None
+
         if self.is_cancelled:
-            LOGGER.info("Cancelled in _merge_and_rmaudio.")
+            LOGGER.info(f"Cancelled before processing for MID: {self.listener.mid}")
             return None
 
         streams_to_remove = self.data.get('streams_to_remove', [])

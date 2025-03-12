@@ -7,8 +7,7 @@ from asyncio import create_subprocess_exec, gather, Event, Semaphore, wait_for, 
 from asyncio.subprocess import PIPE
 from natsort import natsorted
 from os import path as ospath, walk
-
-from bot import task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME
+from bot import task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME, bot
 from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec, new_task
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target
 from bot.helper.ext_utils.media_utils import get_document_type, FFProgress
@@ -16,7 +15,6 @@ from bot.helper.listeners import tasks_listener as task
 from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
 from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendMessage
 
-# Global semaphore for upload concurrency
 UPLOAD_SEMAPHORE = Semaphore(3)
 
 async def get_metavideo(video_file):
@@ -48,6 +46,7 @@ class VidEcxecutor(FFProgress):
         self.is_cancelled = False
         self._processed_bytes = 0
         self._last_uploaded = 0
+        self._start_time = time()
         LOGGER.info(f"Initialized VidEcxecutor for MID: {self.listener.mid}, path: {self.path}")
 
     async def _cleanup(self):
@@ -98,7 +97,7 @@ class VidEcxecutor(FFProgress):
 
     async def _upload_progress(self, current, _):
         if self.is_cancelled:
-            raise Exception("Upload cancelled")
+            bot.stop_transmission()
         chunk_size = current - self._last_uploaded
         self._last_uploaded = current
         self._processed_bytes += chunk_size
@@ -107,15 +106,27 @@ class VidEcxecutor(FFProgress):
         async with UPLOAD_SEMAPHORE:
             try:
                 LOGGER.info(f"Uploading file for MID: {self.listener.mid}: {file_path}")
-                # Placeholder for actual upload logic (e.g., Telegram API call)
-                # Replace with bot.send_document or similar from TgUploader
-                await wait_for(sendMessage(f"Uploading {file_path}", self.listener.message), timeout=600)
+                caption = f"<code>{ospath.basename(file_path)}</code>"
+                self._send_msg = await bot.send_document(
+                    chat_id=self.listener.message.chat.id,
+                    document=file_path,
+                    caption=caption,
+                    disable_notification=True,
+                    progress=self._upload_progress,
+                    reply_to_message_id=self.listener.message.id
+                )
+                await wait_for(self._send_msg.wait(), timeout=600)
                 LOGGER.info(f"Upload completed for MID: {self.listener.mid}: {file_path}")
-                return file_path
+                return self._send_msg.link
             except TimeoutError:
                 LOGGER.error(f"Upload timed out for MID: {self.listener.mid}: {file_path}")
                 self.is_cancelled = True
                 await self.listener.onUploadError("Upload timed out after 10 minutes")
+                return None
+            except Exception as e:
+                LOGGER.error(f"Upload error for MID: {self.listener.mid}: {e}")
+                self.is_cancelled = True
+                await self.listener.onUploadError(f"Upload failed: {e}")
                 return None
 
     async def execute(self):
@@ -139,9 +150,9 @@ class VidEcxecutor(FFProgress):
             if self.mode == 'merge_rmaudio':
                 result = await self._merge_and_rmaudio(file_list)
                 if result and not self.is_cancelled:
-                    uploaded_file = await self._upload_file(result)
-                    if uploaded_file:
-                        await self.listener.onUploadComplete(uploaded_file, self.size, {}, 1, 0)
+                    uploaded_link = await self._upload_file(result)
+                    if uploaded_link:
+                        await self.listener.onUploadComplete(uploaded_link, self.size, {uploaded_link: self.name}, 1, 0)
                     else:
                         return None
             else:

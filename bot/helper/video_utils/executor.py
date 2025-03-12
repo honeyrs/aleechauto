@@ -7,6 +7,7 @@ from asyncio import create_subprocess_exec, gather, Event, Semaphore, wait_for, 
 from asyncio.subprocess import PIPE
 from natsort import natsorted
 from os import path as ospath, walk
+from time import time
 from bot import task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME, bot
 from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec, new_task
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target

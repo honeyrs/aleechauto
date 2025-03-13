@@ -33,12 +33,13 @@ class VidEcxecutor(FFProgress):
         self.gid = gid
         self.mid = listener.message.id
         self.name = listener.name
+        self.mode, _, _ = listener.vidMode  # Extract mode from vidMode tuple
         self.size = 0
         self.outfile = ''
         self.event = Event()
         self.is_cancelled = False
         self._files = []
-        LOGGER.info(f"Initialized VidEcxecutor for MID: {self.mid}, path: {self.path}")
+        LOGGER.info(f"Initialized VidEcxecutor for MID: {self.mid}, path: {self.path}, mode: {self.mode}")
 
     async def clean(self):
         try:
@@ -101,8 +102,7 @@ class VidEcxecutor(FFProgress):
 
     async def execute(self):
         try:
-            mode, name, kwargs = self.listener.vidMode
-            LOGGER.info(f"Executing {mode} for MID: {self.mid}")
+            LOGGER.info(f"Executing {self.mode} for MID: {self.mid}")
             file_list = await self._get_files()
             if not file_list:
                 await self.listener.onUploadError("No valid media files found.")
@@ -121,7 +121,7 @@ class VidEcxecutor(FFProgress):
             async with queue_dict_lock:
                 non_queued_up.add(self.mid)
 
-            if mode == 'merge_rmaudio':
+            if self.mode == 'merge_rmaudio':
                 result = await self._merge_and_rmaudio(file_list)
                 if result and not self.is_cancelled:
                     link = await self._upload_file(result)
@@ -138,7 +138,7 @@ class VidEcxecutor(FFProgress):
                     await self.clean()
                     return None
             else:
-                await self.listener.onUploadError(f"Unsupported mode: {mode}")
+                await self.listener.onUploadError(f"Unsupported mode: {self.mode}")
                 await self.clean()
                 return None
             return result

@@ -186,6 +186,7 @@ class VidEcxecutor(FFProgress):
         add_to_queue, event = False, None
         if config_dict.get('QUEUE_ALL') or config_dict.get('QUEUE_COMPLETE'):
             async with queue_dict_lock:
+                LOGGER.info(f"Queue state - queued_up: {list(queued_up.keys())}, non_queued_up: {non_queued_up}")
                 if self.mid not in non_queued_up:
                     add_to_queue = True
                     event = Event()
@@ -201,6 +202,8 @@ class VidEcxecutor(FFProgress):
                         LOGGER.info(f"Task {self.mid} removed from task_dict before execution")
                         return None
                 LOGGER.info(f"Starting from Queued/Upload: {self.name}")
+        else:
+            LOGGER.info(f"Queue bypassed due to config for MID: {self.mid}")
 
         async with queue_dict_lock:
             non_queued_up.add(self.mid)

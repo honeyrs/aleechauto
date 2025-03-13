@@ -11,7 +11,6 @@ from os import path as ospath, walk
 from time import time
 
 from bot import bot, task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME, config_dict, queue_dict_lock, non_queued_up, non_queued_dl, queued_up, queued_dl, aria2, Intervals, DATABASE_URL
-from bot.helper.common import TaskConfig
 from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec, new_task
 from bot.helper.ext_utils.db_handler import DbManager
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target, clean_download
@@ -35,10 +34,9 @@ async def get_metavideo(video_file):
         LOGGER.error(f"Error in get_metavideo: {e}")
         return []
 
-class VidEcxecutor(FFProgress, TaskConfig):
+class VidEcxecutor(FFProgress):
     def __init__(self, listener: task.TaskListener, path: str, gid: str, metadata=False):
-        FFProgress.__init__(self)
-        TaskConfig.__init__(self)
+        super().__init__()
         self.data = {}
         self.event = Event()
         self.listener = listener
@@ -54,7 +52,7 @@ class VidEcxecutor(FFProgress, TaskConfig):
         self._processed_bytes = 0
         self._last_uploaded = 0
         self._start_time = time()
-        self.mid = listener.mid
+        self.mid = self.listener.message.id  # Use listener's message ID
         LOGGER.info(f"Initialized VidEcxecutor for MID: {self.mid}, path: {self.path}")
 
     @staticmethod

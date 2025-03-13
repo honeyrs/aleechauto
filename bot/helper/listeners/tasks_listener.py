@@ -249,66 +249,104 @@ class TaskListener(TaskConfig):
             await DbManager().rm_complete_task(self.message.link)
 
         LOGGER.info(f"Task Done: {self.name} (MID: {self.mid})")
-        dt_date, dt_time = get_date_time(self.message)
-        buttons = ButtonMaker()
-        buttons_scr = ButtonMaker()
-        daily_size = size
         size_str = get_readable_file_size(size)
-        reply_to = self.message.reply_to_message
-        images = choice(config_dict['IMAGE_COMPLETE'].split())
-        TIME_ZONE_TITLE = config_dict['TIME_ZONE_TITLE']
+        elapsed_time = get_readable_time(time() - self.message.date.timestamp())
+        dt_date, dt_time = get_date_time(self.message)  # Current date/time
+        buttons = ButtonMaker()
 
+        # Fetch stream details from VidEcxecutor if available
+        stream_info = {}
+        if self.vidMode:
+            async with task_dict_lock:
+                if self.mid in task_dict and hasattr(task_dict[self.mid], 'executor'):
+                    executor = task_dict[self.mid].executor
+                    stream_info = executor.data.get('streams', {})
+                    streams_to_remove = executor.data.get('streams_to_remove', [])
+
+        # Analyze streams
+        video_stream, audio_kept, audio_removed, subs_removed = None, [], [], []
+        for index, stream in stream_info.items():
+            if stream['codec_type'] == 'video':
+                video_stream = stream
+            elif stream['codec_type'] == 'audio':
+                if index in streams_to_remove:
+                    audio_removed.append(stream)
+                else:
+                    audio_kept.append(stream)
+            elif stream['codec_type'] == 'subtitle' and index in streams_to_remove:
+                subs_removed.append(stream)
+
+        # Build enhanced message (Telegram style with rich details)
+        msg = f"📢 *{bot_name}* | [{dt_date} {dt_time}]\n"
+        msg += "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+        msg += f"🎬 *Task Done:* `{escape(self.name)}`\n"
+        msg += f"┌ 📏 *Size:* {size_str}\n"
+        msg += f"├ 📂 *Files:* {len(files) if files else 1}\n"
+        msg += f"├ ⏱️ *Elapsed:* {elapsed_time}\n"
+
+        # Video details
+        if video_stream:
+            duration = get_readable_time(float(video_stream.get('duration', 0))) if 'duration' in video_stream else "Unknown"
+            msg += f"├ ⏳ *Duration:* {duration}\n"
+            msg += f"├ 🎥 *Video:* {video_stream.get('codec_name', 'Unknown').upper()}, {video_stream.get('height', 'Unknown')}p, {video_stream.get('r_frame_rate', 'Unknown')}fps\n"
+
+        # Audio kept
+        if audio_kept:
+            audio_str = " | ".join(
+                f"{s.get('codec_name', 'Unknown').upper()}, {s.get('tags', {}).get('language', 'Unknown').title()}, {s.get('channel_layout', 'Unknown')}"
+                for s in audio_kept
+            )
+            msg += f"├ 🔊 *Audio Kept:* {audio_str}\n"
+
+        # Audio removed
+        if audio_removed:
+            audio_rm_str = "\n   • ".join(
+                f"{s.get('codec_name', 'Unknown').upper()}, {s.get('tags', {}).get('language', 'Unknown').title()}, {s.get('channel_layout', 'Unknown')}"
+                for s in audio_removed
+            )
+            msg += f"├ 🚫 *Audio Removed:* \n   • {audio_rm_str}\n"
+
+        # Subtitles removed
+        if subs_removed:
+            subs_rm_str = " | ".join(
+                f"{s.get('codec_name', 'Unknown').upper()}, {s.get('tags', {}).get('language', 'Unknown').title()}"
+                for s in subs_removed
+            )
+            msg += f"├ 🚫 *Subtitles Removed:* {subs_rm_str}\n"
+
+        # Stream count
+        total_streams = len(stream_info)
+        msg += f"├ 📊 *Streams:* {total_streams} ({1 if video_stream else 0} Video, {len(audio_kept)} Audio)\n"
+
+        # Metadata
+        msg += f"├ 👤 *Requested by:* {self.tag}\n"
+        msg += f"└ ⚡ *Action:* #{action(self.message).lower()}\n"
+
+        # Link (for leech)
+        if self.isLeech and files:
+            for idx, (tlink, fname) in enumerate(files.items(), 1):
+                buttons.button_link(f"Download #{idx}", tlink)
+                msg += f"🔗 *Download #{idx}:* [{fname}]({tlink})\n"
+        elif link:
+            buttons.button_link("Cloud Link", link)
+            msg += f"🔗 *Download:* [Click Here]({link})\n"
+
+        # Footer
+        msg += "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+        msg += f"🌟 *Bot By:* [Mahesh Kadali](https://t.me/maheshsirop)"
+
+        # Thumbnail handling
         thumb_path = ospath.join(self.dir, 'thumb.png')
         if not await aiopath.exists(thumb_path):
             LOGGER.info(f"Thumbnail not found at {thumb_path}, using default")
-            thumb_path = None
+            thumb_path = choice(config_dict['IMAGE_COMPLETE'].split())
 
-        msg = f'<a href="https://t.me/maheshsirop"><b><i>Bot By Mahesh Kadali</b></i></a>\n'
-        msg += f'<code>{escape(self.name)}</code>\n'
-        msg += f'<b>┌ Size: </b>{size_str}\n'
+        # Send message
+        uploadmsg = await sendingMessage(msg, self.message, thumb_path, buttons.build_menu(1))
 
-        if self.isLeech:
-            if config_dict['SOURCE_LINK']:
-                scr_link = get_link(self.message)
-                if is_magnet(scr_link):
-                    tele = TelePost(config_dict['SOURCE_LINK_TITLE'])
-                    mag_link = await sync_to_async(tele.create_post, f'<code>{escape(self.name)}<br>({size_str})</code><br>{scr_link}')
-                    buttons.button_link('Source Link', mag_link)
-                    buttons_scr.button_link('Source Link', mag_link)
-                elif is_url(scr_link):
-                    buttons.button_link('Source Link', scr_link)
-                    buttons_scr.button_link('Source Link', scr_link)
-            if self.user_dict.get('enable_pm') and self.isSuperChat:
-                buttons.button_link('View File(s)', f'http://t.me/{bot_name}')
-            msg += f'<b>├ Total Files: </b>{folders}\n'
-            if mime_type and mime_type != 0:
-                msg += f'<b>├ Corrupted Files: </b>{mime_type}\n'
-            msg += (f'<b>├ Elapsed: </b>{get_readable_time(time() - self.message.date.timestamp())}\n'
-                    f'<b>├ Cc: </b>{self.tag}\n'
-                    f'<b>└ Action: </b>{action(self.message)}\n\n')
-            if files:
-                fmsg = '<b>Leech File(s):</b>\n'
-                for index, (tlink, name) in enumerate(files.items(), start=1):
-                    fmsg += f'{index}. <a href="{tlink}">{name}</a>\n'
-                msg += fmsg
-            uploadmsg = await sendingMessage(msg, self.message, images if not thumb_path else thumb_path, buttons.build_menu(2))
-        else:
-            msg += f'<b>├ Type: </b>{mime_type or "File"}\n'
-            if mime_type == 'Folder':
-                if folders:
-                    msg += f'<b>├ SubFolders: </b>{folders}\n'
-                msg += f'<b>├ Files: </b>{files}\n'
-            msg += (f'<b>├ Elapsed: </b>{get_readable_time(time() - self.message.date.timestamp())}\n'
-                    f'<b>├ Cc: </b>{self.tag}\n'
-                    f'<b>└ Action: </b>{action(self.message)}\n')
-            if link:
-                buttons.button_link('Cloud Link', link)
-            elif rclonePath:
-                msg += f'\n\n<b>Path:</b> <code>{rclonePath}</code>'
-            uploadmsg = await sendingMessage(msg, self.message, images if not thumb_path else thumb_path, buttons.build_menu(2))
-
+        # Additional actions
         if self.user_dict.get('enable_pm') and self.isSuperChat:
-            await copyMessage(self.user_id, uploadmsg, buttons_scr.build_menu(2))
+            await copyMessage(self.user_id, uploadmsg, buttons.build_menu(1))
         if chat_id := config_dict.get('LEECH_LOG') if self.isLeech else config_dict.get('MIRROR_LOG'):
             await copyMessage(chat_id, uploadmsg)
 
@@ -329,7 +367,7 @@ class TaskListener(TaskConfig):
         await start_from_queued()
 
         if self.isSuperChat and (stime := config_dict['AUTO_DELETE_UPLOAD_MESSAGE_DURATION']):
-            bot_loop.create_task(auto_delete_message(self.message, uploadmsg, reply_to, stime=stime))
+            bot_loop.create_task(auto_delete_message(self.message, uploadmsg, self.message.reply_to_message, stime=stime))
 
     async def onDownloadError(self, error, listfile=None):
         LOGGER.error(f"Download error for MID: {self.mid}: {error}")

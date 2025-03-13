@@ -3,7 +3,7 @@ from aiofiles import open as aiopen
 from aiofiles.os import path as aiopath, makedirs
 from aioshutil import rmtree
 from ast import literal_eval
-from asyncio import create_subprocess_exec, gather, Event, Semaphore, TimeoutError
+from asyncio import create_subprocess_exec, gather, Event, Semaphore, wait_for, TimeoutError  # Added wait_for back
 from asyncio.subprocess import PIPE
 from natsort import natsorted
 from os import path as ospath, walk
@@ -117,7 +117,6 @@ class VidEcxecutor(FFProgress):
                     progress=self._upload_progress,
                     reply_to_message_id=self.listener.message.id
                 )
-                # No wait() needed; send_document is already async and completes here
                 if not self._send_msg or not hasattr(self._send_msg, 'link'):
                     raise ValueError("Upload failed: No valid message returned")
                 LOGGER.info(f"Upload completed for MID: {self.listener.mid}: {file_path}")
@@ -264,7 +263,7 @@ class VidEcxecutor(FFProgress):
 
         await self._start_handler(streams)
         try:
-            await wait_for(self.event.wait(), timeout=180)
+            await wait_for(self.event.wait(), timeout=180)  # Now works with import
         except TimeoutError:
             LOGGER.error(f"Stream selection timed out for MID: {self.listener.mid}")
             self.is_cancelled = True
@@ -292,9 +291,7 @@ class VidEcxecutor(FFProgress):
             kept_streams = [f'0:{s["index"]}' for s in streams if s['index'] not in streams_to_remove and s['codec_type'] != 'video']
             for stream in kept_streams:
                 cmd.extend(['-map', stream])
-            cmd.extend(['-c', 'copy',
-
- self.outfile, '-y'])
+            cmd.extend(['-c', 'copy', self.outfile, '-y'])
 
             if not await self._run_cmd(cmd, 'direct'):
                 await sendMessage("Merging failed due to FFmpeg error.", self.listener.message)

@@ -251,7 +251,7 @@ class TaskListener(TaskConfig):
         LOGGER.info(f"Task Done: {self.name} (MID: {self.mid})")
         size_str = get_readable_file_size(size)
         elapsed_time = get_readable_time(time() - self.message.date.timestamp())
-        dt_date, dt_time = get_date_time(self.message)  # Current date/time
+        dt_date, dt_time = get_date_time(self.message)
         buttons = ButtonMaker()
 
         # Fetch stream details from VidEcxecutor if available
@@ -276,7 +276,7 @@ class TaskListener(TaskConfig):
             elif stream['codec_type'] == 'subtitle' and index in streams_to_remove:
                 subs_removed.append(stream)
 
-        # Build enhanced message (Telegram style with rich details)
+        # Exact UI match as per your request
         msg = f"📢 *{bot_name}* | [{dt_date} {dt_time}]\n"
         msg += "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
         msg += f"🎬 *Task Done:* `{escape(self.name)}`\n"
@@ -284,13 +284,11 @@ class TaskListener(TaskConfig):
         msg += f"├ 📂 *Files:* {len(files) if files else 1}\n"
         msg += f"├ ⏱️ *Elapsed:* {elapsed_time}\n"
 
-        # Video details
         if video_stream:
             duration = get_readable_time(float(video_stream.get('duration', 0))) if 'duration' in video_stream else "Unknown"
             msg += f"├ ⏳ *Duration:* {duration}\n"
             msg += f"├ 🎥 *Video:* {video_stream.get('codec_name', 'Unknown').upper()}, {video_stream.get('height', 'Unknown')}p, {video_stream.get('r_frame_rate', 'Unknown')}fps\n"
 
-        # Audio kept
         if audio_kept:
             audio_str = " | ".join(
                 f"{s.get('codec_name', 'Unknown').upper()}, {s.get('tags', {}).get('language', 'Unknown').title()}, {s.get('channel_layout', 'Unknown')}"
@@ -298,7 +296,6 @@ class TaskListener(TaskConfig):
             )
             msg += f"├ 🔊 *Audio Kept:* {audio_str}\n"
 
-        # Audio removed
         if audio_removed:
             audio_rm_str = "\n   • ".join(
                 f"{s.get('codec_name', 'Unknown').upper()}, {s.get('tags', {}).get('language', 'Unknown').title()}, {s.get('channel_layout', 'Unknown')}"
@@ -306,7 +303,6 @@ class TaskListener(TaskConfig):
             )
             msg += f"├ 🚫 *Audio Removed:* \n   • {audio_rm_str}\n"
 
-        # Subtitles removed
         if subs_removed:
             subs_rm_str = " | ".join(
                 f"{s.get('codec_name', 'Unknown').upper()}, {s.get('tags', {}).get('language', 'Unknown').title()}"
@@ -314,15 +310,11 @@ class TaskListener(TaskConfig):
             )
             msg += f"├ 🚫 *Subtitles Removed:* {subs_rm_str}\n"
 
-        # Stream count
         total_streams = len(stream_info)
         msg += f"├ 📊 *Streams:* {total_streams} ({1 if video_stream else 0} Video, {len(audio_kept)} Audio)\n"
-
-        # Metadata
         msg += f"├ 👤 *Requested by:* {self.tag}\n"
         msg += f"└ ⚡ *Action:* #{action(self.message).lower()}\n"
 
-        # Link (for leech)
         if self.isLeech and files:
             for idx, (tlink, fname) in enumerate(files.items(), 1):
                 buttons.button_link(f"Download #{idx}", tlink)
@@ -331,7 +323,6 @@ class TaskListener(TaskConfig):
             buttons.button_link("Cloud Link", link)
             msg += f"🔗 *Download:* [Click Here]({link})\n"
 
-        # Footer
         msg += "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
         msg += f"🌟 *Bot By:* [Mahesh Kadali](https://t.me/maheshsirop)"
 

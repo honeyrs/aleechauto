@@ -56,7 +56,7 @@ async def check_limits_size(listener, size, playlist=False, play_count=False):
 
 async def check_running_tasks(mid: int, state='dl'):
     all_limit = config_dict['QUEUE_ALL']
-    state_limit = (config_dict['QUEUE_DOWNLOAD'] if state == 'dl' else config_dict['QUEUE_UPLOAD'])
+    state_limit = config_dict['QUEUE_DOWNLOAD'] if state == 'dl' else config_dict['QUEUE_UPLOAD']
     event = None
     is_over_limit = False
     if all_limit or state_limit:
@@ -64,7 +64,7 @@ async def check_running_tasks(mid: int, state='dl'):
             if state == 'up' and mid in non_queued_dl:
                 non_queued_dl.remove(mid)
             dl_count, up_count = len(non_queued_dl), len(non_queued_up)
-            is_over_limit = (all_limit and dl_count + up_count >= all_limit and (not state_limit or (state == 'dl' and dl_count >= state_limit) or (state == 'up' and up_count >= state_limit))) or \
+            is_over_limit = (all_limit and dl_count + up_count >= all_limit) or \
                             (state_limit and ((state == 'dl' and dl_count >= state_limit) or (state == 'up' and up_count >= state_limit)))
             if is_over_limit:
                 event = Event()
@@ -78,54 +78,52 @@ async def check_running_tasks(mid: int, state='dl'):
 async def start_dl_from_queued(mid: int):
     async with queue_dict_lock:
         if mid in queued_dl:
+            LOGGER.info(f"Releasing queued download task MID: {mid}")
             queued_dl[mid].set()
             del queued_dl[mid]
-    await sleep(0.7)
+    await sleep(0.5)
 
 async def start_up_from_queued(mid: int):
     async with queue_dict_lock:
         if mid in queued_up:
+            LOGGER.info(f"Releasing queued upload task MID: {mid}")
             queued_up[mid].set()
             del queued_up[mid]
-    await sleep(0.7)
+    await sleep(0.5)
 
 async def start_task_from_queued(task_type, limit, non_queued, queued):
     async with queue_dict_lock:
         count = len(non_queued)
         if queued and count < limit:
-            f_tasks = int(min(limit - count, len(queued)))
-            LOGGER.info(f"Starting {task_type} tasks - count: {count}, limit: {limit}, to_start: {f_tasks}")
-            for index, mid in enumerate(list(queued.keys()), start=1):
+            to_start = min(limit - count, len(queued))
+            LOGGER.info(f"Starting {task_type} tasks - count: {count}, limit: {limit}, to_start: {to_start}")
+            for mid in list(queued.keys())[:to_start]:
                 if task_type == 'up':
                     await start_up_from_queued(mid)
                 else:
                     await start_dl_from_queued(mid)
-                if index == f_tasks:
-                    break
 
 async def start_from_queued():
-    all_limit, dl_limit, up_limit = config_dict['QUEUE_ALL'], config_dict['QUEUE_DOWNLOAD'], config_dict['QUEUE_UPLOAD']
+    all_limit = config_dict['QUEUE_ALL']
+    dl_limit = config_dict['QUEUE_DOWNLOAD']
+    up_limit = config_dict['QUEUE_UPLOAD']
     LOGGER.info(f"start_from_queued called - all_limit: {all_limit}, dl_limit: {dl_limit}, up_limit: {up_limit}, queued_up: {list(queued_up.keys())}, non_queued_up: {non_queued_up}")
 
     async with queue_dict_lock:
-        dl, up = len(non_queued_dl), len(non_queued_up)
-        all_ = dl + up
-        LOGGER.info(f"Queue stats - dl: {dl}, up: {up}, all: {all_}")
+        dl_count, up_count = len(non_queued_dl), len(non_queued_up)
+        all_count = dl_count + up_count
+        LOGGER.info(f"Queue stats - dl: {dl_count}, up: {up_count}, all: {all_count}")
 
-    if all_limit and all_ >= all_limit:
+    if all_limit and all_count >= all_limit:
         LOGGER.info("All limit reached, no tasks started")
         return
 
     if up_limit:
-        LOGGER.info(f"Processing queued_up with up_limit: {up_limit}")
         await start_task_from_queued('up', up_limit, non_queued_up, queued_up)
     elif queued_up:
-        LOGGER.info("Processing queued_up with no limit")
         await start_task_from_queued('up', float('inf'), non_queued_up, queued_up)
 
     if dl_limit:
-        LOGGER.info(f"Processing queued_dl with dl_limit: {dl_limit}")
         await start_task_from_queued('dl', dl_limit, non_queued_dl, queued_dl)
     elif queued_dl:
-        LOGGER.info("Processing queued_dl with no limit")
         await start_task_from_queued('dl', float('inf'), non_queued_dl, queued_dl)

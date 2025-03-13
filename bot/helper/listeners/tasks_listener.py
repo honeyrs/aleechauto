@@ -7,7 +7,7 @@ from random import choice
 from requests import utils as rutils
 from time import time
 
-from bot import bot_loop, bot_name, task_dict, task_dict_lock, Intervals, aria2, config_dict, non_queued_up, non_queued_dl, queued_up, queued_dl, queue_dict_lock, LOGGER, DATABASE_URL
+from bot import bot_loop, bot_name, task_dict, task_dict_lock, Intervals, aria2, config_dict, non_queued_up, non_queued_dl, queued_up, queued_dl, queue_dict_lock, LOGGER, DATABASE_URL, bot
 from bot.helper.common import TaskConfig
 from bot.helper.ext_utils.bot_utils import is_premium_user, UserDaily, default_button, sync_to_async
 from bot.helper.ext_utils.db_handler import DbManager
@@ -141,17 +141,23 @@ class TaskListener(TaskConfig):
             if not up_path:
                 return
             self.seed = False
-            LOGGER.info(f"VidEcxecutor completed for MID: {self.mid}, upload handled, exiting")
-            # VidEcxecutor handles upload and cleanup, so exit here
+            LOGGER.info(f"VidEcxecutor completed for MID: {self.mid}, proceeding to Telegram upload")
+            up_dir, self.name = ospath.split(up_path)
+            size = await get_path_size(up_dir)
+            # Handle Telegram upload directly for -vt tasks
+            LOGGER.info(f"Leeching {self.name} (MID: {self.mid})")
+            tg = TgUploader(self, up_dir, size)
+            async with task_dict_lock:
+                task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
+            await gather(update_status_message(self.message.chat.id), tg.upload([], []))
+            await clean_download(self.dir)
+            async with task_dict_lock:
+                task_dict.pop(self.mid, None)
             async with queue_dict_lock:
                 if self.mid in non_queued_up:
                     non_queued_up.remove(self.mid)
             await start_from_queued()
-            return
-
-        if not self.compress and not self.extract:
-            up_path = await self.preName(up_path)
-            await self.editMetadata(up_path, gid)
+            return  # Exit to prevent RClone/GDrive upload
 
         if one_path := await self.isOneFile(up_path):
             up_path = one_path
@@ -180,7 +186,6 @@ class TaskListener(TaskConfig):
             async with queue_dict_lock:
                 non_queued_up.add(self.mid)
 
-            LOGGER.info(f"Triggering start_from_queued for MID: {self.mid}, queued_up: {list(queued_up.keys())}")
             await start_from_queued()
 
             size = await get_path_size(up_dir)

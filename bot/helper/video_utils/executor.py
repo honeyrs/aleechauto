@@ -1,194 +1,289 @@
-from asyncio import create_subprocess_exec, gather, Event, Semaphore, wait_for, TimeoutError as AsyncTimeoutError
+from __future__ import annotations
+from aiofiles import open as aiopen
 from aiofiles.os import path as aiopath, makedirs
 from aioshutil import rmtree
 from ast import literal_eval
-from mimetypes import guess_type
+from asyncio import create_subprocess_exec, gather, Event, wait_for, TimeoutError as AsyncTimeoutError
+from asyncio.subprocess import PIPE
 from natsort import natsorted
 from os import path as ospath, walk
 from time import time
 
-from bot import bot, task_dict, task_dict_lock, LOGGER, config_dict, queue_dict_lock, non_queued_up, queued_up, Intervals, DATABASE_URL
-from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec
+from bot import task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME, bot, queue_dict_lock, non_queued_up
+from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec, new_task
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target, clean_download
-from bot.helper.ext_utils.media_utils import FFProgress
+from bot.helper.ext_utils.media_utils import get_document_type, FFProgress
 from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
 from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
-from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendMessage, update_status_message, delete_status
+from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendMessage
 from bot.helper.ext_utils.task_manager import start_from_queued, check_running_tasks
-
-UPLOAD_SEMAPHORE = Semaphore(5)
+from bot.helper.listeners import tasks_listener as task
 
 async def get_metavideo(video_file):
-    stdout, stderr, rcode = await cmd_exec(['ffprobe', '-hide_banner', '-print_format', 'json', '-show_streams', video_file])
-    if rcode != 0:
-        LOGGER.error(f"ffprobe error: {stderr}")
+    try:
+        stdout, stderr, rcode = await cmd_exec(['ffprobe', '-hide_banner', '-print_format', 'json', '-show_streams', video_file])
+        if rcode != 0:
+            LOGGER.error(f"ffprobe error for {video_file}: {stderr}")
+            return []
+        metadata = literal_eval(stdout)
+        return metadata.get('streams', [])
+    except Exception as e:
+        LOGGER.error(f"Error in get_metavideo: {e}")
         return []
-    return literal_eval(stdout).get('streams', [])
 
 class VidEcxecutor(FFProgress):
-    def __init__(self, listener, path, gid):
+    def __init__(self, listener: task.TaskListener, path: str, gid: str, metadata=False):
         super().__init__()
+        self.data = {}  # Initialized for ExtraSelect
+        self.event = Event()
         self.listener = listener
         self.path = path
-        self.gid = gid
-        self.mid = listener.message.id
-        self.name = listener.name
-        self.mode, _, _ = listener.vidMode  # Extract mode from vidMode tuple
-        self.size = 0
+        self.name = ''
         self.outfile = ''
-        self.event = Event()
-        self.is_cancelled = False
+        self.size = 0
+        self._metadata = metadata
+        self._up_path = path
+        self._gid = gid
         self._files = []
-        LOGGER.info(f"Initialized VidEcxecutor for MID: {self.mid}, path: {self.path}, mode: {self.mode}")
+        self.is_cancelled = False
+        LOGGER.info(f"Initialized VidEcxecutor for MID: {self.listener.mid}, path: {self.path}")
 
-    async def clean(self):
+    async def _cleanup(self):
         try:
             for f in self._files:
                 if await aiopath.exists(f):
                     await clean_target(f)
             self._files.clear()
+            input_file = ospath.join(self.path, f'input_{self._gid}.txt')
+            if await aiopath.exists(input_file):
+                await clean_target(input_file)
+            self.data.clear()
             self.is_cancelled = True
             async with task_dict_lock:
-                task_dict.pop(self.mid, None)
+                task_dict.pop(self.listener.mid, None)
             await clean_download(self.path)
-            if not task_dict:
-                if st := Intervals['status']:
-                    for intvl in list(st.values()):
-                        intvl.cancel()
-                    Intervals['status'].clear()
-                await delete_status()
+            async with queue_dict_lock:
+                if self.listener.mid in non_queued_up:
+                    non_queued_up.remove(self.listener.mid)
             await start_from_queued()
+            LOGGER.info(f"Cleanup completed for MID: {self.listener.mid}")
         except Exception as e:
             LOGGER.error(f"Cleanup error: {e}")
 
-    async def _is_media_file(self, file_path):
-        mime_type, _ = guess_type(file_path)
-        return mime_type and (mime_type.startswith('video') or mime_type.startswith('audio'))
+    async def _extract_zip(self, zip_path):
+        extract_dir = ospath.join(ospath.dirname(zip_path), f"extracted_{self._gid}")
+        try:
+            await makedirs(extract_dir, exist_ok=True)
+            cmd = ['7z', 'x', zip_path, f'-o{extract_dir}', '-y']
+            _, stderr, rcode = await cmd_exec(cmd)
+            if rcode != 0:
+                LOGGER.error(f"Failed to extract ZIP: {stderr}")
+                await rmtree(extract_dir, ignore_errors=True)
+                return None
+            LOGGER.info(f"Extracted ZIP to {extract_dir}")
+            return extract_dir
+        except Exception as e:
+            LOGGER.error(f"ZIP extraction error: {e}")
+            await rmtree(extract_dir, ignore_errors=True)
+            return None
 
     async def _get_files(self):
         file_list = []
-        if await aiopath.isfile(self.path) and await self._is_media_file(self.path):
+        if self._metadata:
             file_list.append(self.path)
+        elif await aiopath.isfile(self.path):
+            if self.path.lower().endswith('.zip'):
+                extract_dir = await self._extract_zip(self.path)
+                if extract_dir:
+                    self._files.append(extract_dir)
+                    for dirpath, _, files in await sync_to_async(walk, extract_dir):
+                        for file in natsorted(files):
+                            file_path = ospath.join(dirpath, file)
+                            if (await get_document_type(file_path))[0]:
+                                file_list.append(file_path)
+                                LOGGER.info(f"Found media file: {file_path}")
+            elif (await get_document_type(self.path))[0]:
+                file_list.append(self.path)
         else:
             for dirpath, _, files in await sync_to_async(walk, self.path):
                 for file in natsorted(files):
                     file_path = ospath.join(dirpath, file)
-                    if await self._is_media_file(file_path):
+                    if (await get_document_type(file_path))[0]:
                         file_list.append(file_path)
+                        LOGGER.info(f"Found media file: {file_path}")
         self.size = sum(await gather(*[get_path_size(f) for f in file_list])) if file_list else 0
         return file_list
 
-    async def _upload_file(self, file_path):
-        async with UPLOAD_SEMAPHORE:
-            try:
-                LOGGER.info(f"Uploading file for MID: {self.mid}: {file_path}")
-                caption = f"<code>{ospath.basename(file_path)}</code>"
-                msg = await bot.send_document(
-                    chat_id=self.listener.message.chat.id,
-                    document=file_path,
-                    caption=caption,
-                    disable_notification=True,
-                    reply_to_message_id=self.listener.message.id
-                )
-                if not msg or not hasattr(msg, 'link'):
-                    raise ValueError("Upload failed: No valid message returned")
-                LOGGER.info(f"Upload completed for MID: {self.mid}: {file_path}")
-                return msg.link
-            except Exception as e:
-                LOGGER.error(f"Upload error for MID: {self.mid}: {e}")
-                self.is_cancelled = True
-                await self.listener.onUploadError(f"Upload failed: {e}")
-                return None
-
     async def execute(self):
+        self._is_dir = await aiopath.isdir(self.path)
         try:
-            LOGGER.info(f"Executing {self.mode} for MID: {self.mid}")
-            file_list = await self._get_files()
-            if not file_list:
-                await self.listener.onUploadError("No valid media files found.")
-                return None
+            self.mode, self.name, kwargs = self.listener.vidMode
+        except AttributeError as e:
+            LOGGER.error(f"Invalid vidMode: {e}")
+            await self._cleanup()
+            await self.listener.onUploadError("Invalid video mode configuration.")
+            return None
 
-            add_to_queue, event = await check_running_tasks(self.mid, "up")
-            if add_to_queue:
-                LOGGER.info(f"Added to Queue/Upload: {self.name} (MID: {self.mid})")
-                async with task_dict_lock:
-                    task_dict[self.mid] = QueueStatus(self.listener, self.size, self.gid, 'Up')
-                await event.wait()
-                async with task_dict_lock:
-                    if self.mid not in task_dict:
-                        return None
-                LOGGER.info(f"Starting from Queue/Upload: {self.name} (MID: {self.mid})")
-            async with queue_dict_lock:
-                non_queued_up.add(self.mid)
+        LOGGER.info(f"Executing {self.mode} with name: {self.name} for MID: {self.listener.mid}")
+        file_list = await self._get_files()
+        if not file_list:
+            await sendMessage("No valid video files found.", self.listener.message)
+            await self._cleanup()
+            return None
 
+        add_to_queue, event = await check_running_tasks(self.listener.mid, "up")
+        if add_to_queue:
+            LOGGER.info(f"Added to Queue/Upload: {self.name} (MID: {self.listener.mid})")
+            async with task_dict_lock:
+                task_dict[self.listener.mid] = QueueStatus(self.listener, self.size, self._gid, 'Up')
+            await event.wait()
+            async with task_dict_lock:
+                if self.listener.mid not in task_dict:
+                    return None
+            LOGGER.info(f"Starting from Queue/Upload: {self.name} (MID: {self.listener.mid})")
+        async with queue_dict_lock:
+            non_queued_up.add(self.listener.mid)
+
+        try:
             if self.mode == 'merge_rmaudio':
                 result = await self._merge_and_rmaudio(file_list)
-                if result and not self.is_cancelled:
-                    link = await self._upload_file(result)
-                    if link:
-                        await self.listener.onUploadComplete(link, self.size, {link: ospath.basename(result)}, 1, None)
-                        async with queue_dict_lock:
-                            if self.mid in non_queued_up:
-                                non_queued_up.remove(self.mid)
-                        await start_from_queued()
-                    else:
-                        await self.clean()
-                        return None
-                else:
-                    await self.clean()
-                    return None
             else:
-                await self.listener.onUploadError(f"Unsupported mode: {self.mode}")
-                await self.clean()
+                LOGGER.error(f"Unsupported mode: {self.mode}")
+                result = None
+            if self.is_cancelled or not result:
+                await self._cleanup()
+                await self.listener.onUploadError(f"{self.mode} processing failed.")
                 return None
             return result
         except Exception as e:
-            LOGGER.error(f"Execution error for MID: {self.mid}: {e}", exc_info=True)
-            await self.clean()
-            await self.listener.onUploadError(f"Execution failed: {e}")
+            LOGGER.error(f"Execution error in {self.mode} for MID: {self.listener.mid}: {e}", exc_info=True)
+            await self._cleanup()
+            await self.listener.onUploadError(f"Failed to process {self.mode}.")
             return None
+
+    @new_task
+    async def _start_handler(self, *args):
+        from bot.helper.video_utils.extra_selector import ExtraSelect
+        selector = ExtraSelect(self)
+        await selector.get_buttons(*args)
+
+    async def _send_status(self, status='wait'):
+        try:
+            async with task_dict_lock:
+                task_dict[self.listener.mid] = FFMpegStatus(self.listener, self, self._gid, status)
+            await sendStatusMessage(self.listener.message)
+            LOGGER.info(f"Sent status update: {status} for MID: {self.listener.mid}")
+        except Exception as e:
+            LOGGER.error(f"Failed to send status: {e}")
+
+    async def _final_path(self, outfile=''):
+        try:
+            if self._metadata:
+                self._up_path = outfile or self.outfile
+            else:
+                scan_dir = self._up_path if self._is_dir else ospath.split(self._up_path)[0]
+                for dirpath, _, files in await sync_to_async(walk, scan_dir):
+                    for file in files:
+                        if file != ospath.basename(outfile or self.outfile):
+                            await clean_target(ospath.join(dirpath, file))
+                all_files = [(dirpath, file) for dirpath, _, files in await sync_to_async(walk, scan_dir) for file in files]
+                if len(all_files) == 1:
+                    self._up_path = ospath.join(*all_files[0])
+            self._files.clear()
+            LOGGER.info(f"Final path: {self._up_path} for MID: {self.listener.mid}")
+            return self._up_path
+        except Exception as e:
+            LOGGER.error(f"Final path error: {e}")
+            await self._cleanup()
+            return None
+
+    async def _name_base_dir(self, path, info: str=None, multi: bool=False):
+        base_dir, file_name = ospath.split(path)
+        if not self.name or multi:
+            if info:
+                if await aiopath.isfile(path):
+                    file_name = file_name.rsplit('.', 1)[0]
+                file_name += f'_{info}.mkv'
+                LOGGER.info(f"Generated name: {file_name}")
+            self.name = file_name
+        if not self.name.upper().endswith(('MKV', 'MP4')):
+            self.name += '.mkv'
+        LOGGER.info(f"Set name: {self.name} with base_dir: {base_dir}")
+        return base_dir if await aiopath.isfile(path) else path
+
+    async def _run_cmd(self, cmd, status='prog'):
+        try:
+            await self._send_status(status)
+            LOGGER.info(f"Running FFmpeg cmd: {' '.join(cmd)}")
+            process = await create_subprocess_exec(*cmd, stderr=PIPE)
+            self.listener.suproc = process
+            _, code = await gather(self.progress(status), process.wait())
+            if code == 0:
+                LOGGER.info(f"FFmpeg succeeded for MID: {self.listener.mid}")
+                return True
+            if self.listener.suproc == 'cancelled' or code == -9:
+                self.is_cancelled = True
+                LOGGER.info(f"FFmpeg cancelled for MID: {self.listener.mid}")
+            else:
+                error_msg = (await process.stderr.read()).decode().strip()
+                LOGGER.error(f"FFmpeg error for MID: {self.listener.mid}: {error_msg}")
+                self.is_cancelled = True
+            return False
+        except Exception as e:
+            LOGGER.error(f"Run cmd error for MID: {self.listener.mid}: {e}", exc_info=True)
+            self.is_cancelled = True
+            return False
 
     async def _merge_and_rmaudio(self, file_list):
         streams = await get_metavideo(file_list[0])
         if not streams:
-            await self.listener.onUploadError("No streams found in video file.")
+            LOGGER.error(f"No streams found in {file_list[0]}")
+            await sendMessage("No streams found in the video file.", self.listener.message)
             return None
 
-        base_dir = ospath.dirname(file_list[0])
-        self.outfile = ospath.join(base_dir, f"{self.name}_Merge-RemoveAudio.mkv")
+        base_dir = await self._name_base_dir(file_list[0], 'Merge-RemoveAudio', multi=len(file_list) > 1)
         self._files = file_list
+        self.size = sum(await gather(*[get_path_size(f) for f in file_list])) if file_list else 0
 
-        from bot.helper.video_utils.extra_selector import ExtraSelect
-        selector = ExtraSelect(self)
-        await selector.get_buttons(streams)
+        await self._start_handler(streams)
         try:
             await wait_for(self.event.wait(), timeout=180)
         except AsyncTimeoutError:
-            LOGGER.error(f"Stream selection timed out for MID: {self.mid}")
-            await self.clean()
+            LOGGER.error(f"Stream selection timed out for MID: {self.listener.mid}")
+            await self._cleanup()
             await self.listener.onUploadError("Stream selection timed out.")
             return None
 
         if self.is_cancelled:
+            LOGGER.info(f"Cancelled in _merge_and_rmaudio for MID: {self.listener.mid}")
             return None
 
-        streams_to_remove = getattr(self, 'streams_to_remove', [])
-        cmd = ['ffmpeg', '-i', file_list[0], '-map', '0:v']
-        kept_streams = [f'0:{s["index"]}' for s in streams if s['index'] not in streams_to_remove and s['codec_type'] != 'video']
-        cmd.extend(['-map', stream] for stream in kept_streams)
-        cmd.extend(['-c', 'copy', self.outfile, '-y'])
+        streams_to_remove = self.data.get('streams_to_remove', [])
+        self.outfile = ospath.join(base_dir, self.name)
+        input_file = ospath.join(base_dir, f'input_{self._gid}.txt')
 
-        async with task_dict_lock:
-            task_dict[self.mid] = FFMpegStatus(self.listener, self, self.gid, 'direct')
-        await sendStatusMessage(self.listener.message)
-        process = await create_subprocess_exec(*cmd, stderr=PIPE)
-        _, code = await gather(self.progress('direct'), process.wait())
-        if code != 0:
-            error_msg = (await process.stderr.read()).decode().strip()
-            LOGGER.error(f"FFmpeg error for MID: {self.mid}: {error_msg}")
-            await self.clean()
-            await self.listener.onUploadError("FFmpeg processing failed.")
+        try:
+            if len(file_list) > 1:
+                async with aiopen(input_file, 'w') as f:
+                    await f.write('\n'.join([f"file '{f}'" for f in file_list]))
+                cmd = [FFMPEG_NAME, '-f', 'concat', '-safe', '0', '-i', input_file]
+            else:
+                cmd = [FFMPEG_NAME, '-i', file_list[0]]
+
+            cmd.extend(['-map', '0:v'])
+            kept_streams = [f'0:{s["index"]}' for s in streams if s['index'] not in streams_to_remove and s['codec_type'] != 'video']
+            for stream in kept_streams:
+                cmd.extend(['-map', stream])
+            cmd.extend(['-c', 'copy', self.outfile, '-y'])
+
+            if not await self._run_cmd(cmd, 'direct'):
+                await sendMessage("Merging failed due to FFmpeg error.", self.listener.message)
+                return None
+            return await self._final_path()
+        except Exception as e:
+            LOGGER.error(f"Error in _merge_and_rmaudio for MID: {self.listener.mid}: {e}", exc_info=True)
+            await sendMessage("Processing failed.", self.listener.message)
             return None
-
-        LOGGER.info(f"FFmpeg succeeded for MID: {self.mid}")
-        return self.outfile
+        finally:
+            if len(file_list) > 1:
+                await clean_target(input_file)

@@ -1,5 +1,4 @@
 from __future__ import annotations
-from asyncio import sleep
 from time import time
 
 from bot import LOGGER, VID_MODE, config_dict
@@ -14,7 +13,7 @@ class ExtraSelect:
         self._reply = None
         self.executor = executor
         self.is_cancelled = False
-        LOGGER.info(f"Initialized ExtraSelect for {self.executor.mode} (MID: {self.executor.mid})")
+        LOGGER.info(f"Initialized ExtraSelect for {self.executor.mode} (MID: {self.executor.listener.mid})")
 
     async def _send_message(self, text: str):
         try:
@@ -128,7 +127,6 @@ class ExtraSelect:
         message_text = await self.streams_select(*args)
         await self._send_message(message_text)
         if self._reply:
-            await sleep(5)  # Delay to allow user to see the stream list
             await deleteMessage(self._reply)
 
         if self.is_cancelled:

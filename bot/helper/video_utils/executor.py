@@ -193,7 +193,7 @@ class VidEcxecutor(FFProgress):
                     queued_up[self.mid] = event
                     LOGGER.info(f"Added to Queue/Upload: {self.name}")
                     async with task_dict_lock:
-                        task_dict[self.mid] = QueueStatus(self, self.size, self._gid, 'Up')
+                        task_dict[self.mid] = QueueStatus(self.listener, self.size, self._gid, 'Up')  # Use self.listener instead of self
             if add_to_queue:
                 await event.wait()
                 async with task_dict_lock:
@@ -266,7 +266,7 @@ class VidEcxecutor(FFProgress):
     async def _send_status(self, status='wait'):
         try:
             async with task_dict_lock:
-                task_dict[self.listener.mid] = FFMpegStatus(self.listener, self, self._gid, status)
+                task_dict[self.listener.mid] = FFMpegStatus(self.listener, self, self._gid, status)  # Use self.listener for status
             await sendStatusMessage(self.listener.message)
             LOGGER.info(f"Sent status update: {status} for MID: {self.mid}")
         except Exception as e:

@@ -257,7 +257,7 @@ class VidEcxecutor(FFProgress, TaskConfig):
 
         await clean_download(self.path)
         if config_dict.get('INCOMPLETE_TASK_NOTIFIER') and DATABASE_URL:
-            await Dba await DbManager().rm_complete_task(self.listener.message.link)
+            await DbManager().rm_complete_task(self.listener.message.link)
 
     @new_task
     async def _start_handler(self, *args):

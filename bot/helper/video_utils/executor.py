@@ -17,7 +17,6 @@ from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
 from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
 from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendMessage
 from bot.helper.ext_utils.task_manager import start_from_queued, check_running_tasks
-from bot.helper.listeners import tasks_listener as task
 
 async def get_metavideo(video_file):
     try:
@@ -32,9 +31,9 @@ async def get_metavideo(video_file):
         return []
 
 class VidEcxecutor(FFProgress):
-    def __init__(self, listener: task.TaskListener, path: str, gid: str, metadata=False):
+    def __init__(self, listener, path: str, gid: str, metadata=False):
         super().__init__()
-        self.data = {}  # Initialized for ExtraSelect
+        self.data = {}
         self.event = Event()
         self.listener = listener
         self.path = path
@@ -136,7 +135,13 @@ class VidEcxecutor(FFProgress):
             LOGGER.info(f"Added to Queue/Upload: {self.name} (MID: {self.listener.mid})")
             async with task_dict_lock:
                 task_dict[self.listener.mid] = QueueStatus(self.listener, self.size, self._gid, 'Up')
-            await event.wait()
+            try:
+                await wait_for(event.wait(), timeout=300)  # 5-minute timeout for queue
+            except AsyncTimeoutError:
+                LOGGER.error(f"Queue timeout for MID: {self.listener.mid}")
+                await self._cleanup()
+                await self.listener.onUploadError("Upload queue timeout.")
+                return None
             async with task_dict_lock:
                 if self.listener.mid not in task_dict:
                     return None
@@ -170,7 +175,8 @@ class VidEcxecutor(FFProgress):
     async def _send_status(self, status='wait'):
         try:
             async with task_dict_lock:
-                task_dict[self.listener.mid] = FFMpegStatus(self.listener, self, self._gid, status)
+                if self.listener.mid in task_dict:
+                    task_dict[self.listener.mid] = FFMpegStatus(self.listener, self, self._gid, status)
             await sendStatusMessage(self.listener.message)
             LOGGER.info(f"Sent status update: {status} for MID: {self.listener.mid}")
         except Exception as e:

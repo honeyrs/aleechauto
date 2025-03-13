@@ -1,0 +1,191 @@
+Thank you for your input! I understand you want to enhance the UI with a dynamic, polished look, focusing on replacing the `ExtraSelect` stream selection message with a processing status, using rich formatting with emojis, and including detailed info about kept/removed streams and tracks in the post-upload message. Since you prefer a fully automatic workflow, we’ll keep everything seamless for the user while improving the visual and informational experience. I’ll suggest enhancements, provide example outputs, and ensure all details (e.g., stream metadata, tracks) are included, without generating code yet. Let’s dive into each aspect.
+
+---
+
+### 1. Enhance Dynamic UI
+**Goal**: Make the UI feel lively, modern, and responsive while keeping it fully automatic.
+
+#### Suggested Enhancements
+- **Dynamic Message Updates**:
+  - Use Telegram’s message editing (`editMessageText`) to update a single message through stages (e.g., stream selection → processing → upload → completion). This reduces chat clutter and keeps the user engaged with a "live" progress feel.
+  - Example flow:
+    1. Initial: `🎬 *Analyzing Streams: Love Under Construction* ⏳`
+    2. Processing: `🎬 *Processing Video: Love Under Construction* ⏳`
+    3. Uploading: `🎬 *Uploading: Love Under Construction* 📤`
+    4. Complete: Final completion message (detailed below).
+- **Emoji Animations**:
+  - Use a sequence of emojis to simulate progress (e.g., `⏳➡️🔄➡️⏳` for processing, `📤➡️⬆️➡️📤` for uploading).
+  - Edit the message every 5-10s to cycle through these emojis, creating a simple animation effect.
+- **Progress Indicators**:
+  - For FFmpeg processing, estimate progress (if possible) using `VidEcxecutor.progress()` and show a percentage or bar:
+    - Example: `[█████     ] 50%`
+  - For uploads, calculate approximate progress (e.g., based on file size and upload speed) if Telegram API allows.
+
+#### Example Dynamic UI Flow
+- **Initial Message** (Stream Selection):
+  ```
+  🎬 *Analyzing Streams: Love Under Construction* ⏳
+  ```
+- **Processing** (Updated in place):
+  ```
+  🎬 *Processing Video: Love Under Construction* 🔄
+  [█████     ] 50%
+  ```
+- **Uploading** (Updated in place):
+  ```
+  🎬 *Uploading: Love Under Construction* 📤
+  ```
+- **Completion** (Final update, detailed below):
+  ```
+  🎉 *Task Completed by Mahesh Kadali*
+  📽️ *Name:* Love Under Construction_5E1E0_Merge-RemoveAudio.mkv
+  📏 *Size:* 796.1 MB
+  ⏱️ *Elapsed:* 6m 37s
+  🎥 *Video:* H264, 1080p, 24fps
+  🔊 *Audio Kept:* AAC, Telugu, Stereo
+  🚫 *Audio Removed:* AAC, Tamil, Stereo
+  📊 *Streams:* 2 (1 video, 1 audio)
+  👤 *Cc:* @arjun_G
+  ⚡ *Action:* #leech
+  🔗 *File:* [Download](telegram_link)
+  🌟 *Powered by:* @MaheshBot
+  ```
+
+---
+
+### 2. Replace the Stream Selection Message with a Processing Status
+**Current Behavior**: The `ExtraSelect` message (listing streams and removals) remains visible until the task completes or errors out.
+**Your Request**: Replace it with a processing status once FFmpeg starts.
+
+#### Suggested Enhancements
+- **Replace and Update**:
+  - After `ExtraSelect` auto-selects streams (e.g., keeping Telugu/Hindi, removing Tamil/Malayalam), immediately delete the stream selection message using `deleteMessage(self._reply)`.
+  - Replace it with a processing status message that’s dynamically updated:
+    - Initial: `🎬 *Processing Video: Love Under Construction* ⏳`
+    - Update with progress (if available): `🎬 *Processing Video: Love Under Construction* 🔄 [█████     ] 50%`
+    - On completion: `🎬 *Processing Complete: Love Under Construction* ✅`
+  - After FFmpeg finishes, this message is edited into the final upload completion message (as above).
+- **Seamless Transition**:
+  - Ensure the transition is smooth—no duplicate messages or clutter.
+  - If FFmpeg fails, update to: `❌ *Processing Failed: Love Under Construction*`.
+
+#### Example Processing Status Flow
+- **Initial Stream Selection** (Deleted after selection):
+  ```
+  🎬 *Analyzing Streams: Love Under Construction* ⏳
+  📽️ Video: H264 (1080p) ✅
+  🔊 Audio: AAC (Telugu) ✅
+  🔊 Audio: AAC (Tamil) 🚫
+  📝 Subtitle: SRT (English) 🚫
+  ```
+- **Processing Status** (Replaces above):
+  ```
+  🎬 *Processing Video: Love Under Construction* ⏳
+  ```
+- **With Progress** (Updated):
+  ```
+  🎬 *Processing Video: Love Under Construction* 🔄
+  [█████     ] 50%
+  ```
+- **Processing Complete** (Before upload):
+  ```
+  🎬 *Processing Complete: Love Under Construction* ✅
+  ```
+
+---
+
+### 3. Rich Formatting with Emojis
+**Current Behavior**: The completion message uses some Markdown (e.g., bold for labels) and basic emojis.
+**Your Request**: Enhance with rich formatting and emojis, including details of kept/removed tracks.
+
+#### Suggested Enhancements
+- **Structured Layout**:
+  - Use consistent emojis and bold Markdown to highlight sections.
+  - Group related info (e.g., video/audio streams, metadata) for clarity.
+- **Detailed Stream Info**:
+  - Show kept and removed streams with metadata (codec, language, channels, resolution).
+  - Example:
+    - Kept: `🔊 *Audio Kept:* AAC, Telugu, Stereo`
+    - Removed: `🚫 *Audio Removed:* AAC, Tamil, Stereo | MP3, Malayalam, Mono`
+- **Metadata**:
+  - Include video/audio details (resolution, frame rate, channels) extracted via `ffprobe`.
+- **Branding**:
+  - Add a footer with your bot’s signature.
+
+#### Example Enhanced Completion Message
+```
+🎉 *Task Completed by Mahesh Kadali*
+📽️ *Name:* Love Under Construction_5E1E0_Merge-RemoveAudio.mkv
+📏 *Size:* 796.1 MB
+⏱️ *Elapsed:* 6m 37s
+⏳ *Duration:* 42m 15s
+🎥 *Video:* H264, 1080p, 24fps
+🔊 *Audio Kept:* AAC, Telugu, Stereo
+🚫 *Audio Removed:* AAC, Tamil, Stereo | MP3, Malayalam, Mono
+🚫 *Subtitles Removed:* SRT, English
+📊 *Streams:* 2 (1 video, 1 audio)
+👤 *Cc:* @arjun_G
+⚡ *Action:* #leech
+🔗 *File:* [Download](telegram_link)
+🌟 *Powered by:* @MaheshBot
+
+[Share] [View Log]
+```
+
+---
+
+### 4. Details of Kept/Removed Tracks and Data
+**Current Behavior**: `ExtraSelect` logs removed streams, but this info isn’t shown post-upload.
+**Your Request**: Include kept/removed tracks in the completion message.
+
+#### Suggested Enhancements
+- **Track Details**:
+  - Parse `self.executor.data['streams']` and `self.executor.data['streams_to_remove']` to list:
+    - Kept streams (e.g., video, audio with language).
+    - Removed streams (e.g., audio, subtitles with language).
+  - Include metadata for each:
+    - Video: Codec, Resolution, Frame Rate.
+    - Audio: Codec, Language, Channels.
+    - Subtitles: Format, Language.
+- **Formatting**:
+  - Use emojis to differentiate (✅ for kept, 🚫 for removed).
+  - Group by type (video, audio, subtitles) for clarity.
+
+#### Example Track Details in Completion Message
+```
+🎥 *Video:* H264, 1080p, 24fps ✅
+🔊 *Audio Kept:* AAC, Telugu, Stereo ✅
+🚫 *Audio Removed:* 
+   - AAC, Tamil, Stereo
+   - MP3, Malayalam, Mono
+🚫 *Subtitles Removed:* 
+   - SRT, English
+   - ASS, Hindi
+📊 *Streams:* 2 (1 video, 1 audio)
+```
+
+---
+
+### General UI Considerations
+- **Consistency**: Use a cohesive emoji set (e.g., 🎬, 🔄, ✅, 📽️, 🔊, 🚫, 🎉) matching your current style.
+- **Automation**: Keep everything fully automatic—no user interaction required.
+- **Performance**: `ffprobe` for metadata (~1s) and message edits (~0.1s each) are lightweight for your use case.
+- **Branding**: Your "Bot by Mahesh Kadali" is prominent—linking to `@MaheshBot` adds a professional touch.
+
+---
+
+### My Recommendations
+- **Focus**: Prioritize the **Enhanced Completion Message** with kept/removed tracks—it ties all details together and delights users post-upload.
+- **Next**: Implement the **Dynamic UI** with message updates (stream selection → processing → upload → completion) for a seamless experience.
+- **Finally**: Ensure the **Processing Status** replaces the stream selection message cleanly, keeping the chat tidy.
+
+---
+
+### Your Input
+1. **Design Preferences**: Like the emojis and layout? Any specific ones you’d prefer (e.g., 🔔 instead of 🎉)?
+2. **Track Details**: Want more metadata (e.g., bitrate, sample rate) or keep it concise as shown?
+3. **Dynamic Updates**: Comfortable with the message editing frequency (every 5-10s) for animations/progress?
+4. **Branding**: Should "Powered by @MaheshBot" link to a channel or include a tagline (e.g., "Fast & Reliable")?
+5. **Additional Ideas**: Anything else to add (e.g., upload speed, a progress bar style)?
+
+Let me know your thoughts—I’ll refine the examples further if needed, then generate bug-free code once we’re aligned!

@@ -1,6 +1,6 @@
 from aiofiles.os import listdir, path as aiopath, makedirs
 from aioshutil import move
-from asyncio import sleep, gather
+from asyncio import sleep, gather, wait_for, TimeoutError as AsyncTimeoutError
 from html import escape
 from os import path as ospath
 from random import choice
@@ -144,12 +144,21 @@ class TaskListener(TaskConfig):
             LOGGER.info(f"VidEcxecutor completed for MID: {self.mid}, proceeding to Telegram upload")
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
-            # Handle Telegram upload directly for -vt tasks
             LOGGER.info(f"Leeching {self.name} (MID: {self.mid})")
             tg = TgUploader(self, up_dir, size)
             async with task_dict_lock:
                 task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
-            await gather(update_status_message(self.message.chat.id), tg.upload([], []))
+            try:
+                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload([], [])), timeout=600)  # 10-minute timeout
+                LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
+            except AsyncTimeoutError:
+                LOGGER.error(f"Upload timeout for MID: {self.mid}")
+                await self.onUploadError("Upload timed out after 10 minutes.")
+                return
+            except Exception as e:
+                LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
+                await self.onUploadError(f"Upload failed: {str(e)}")
+                return
             await clean_download(self.dir)
             async with task_dict_lock:
                 task_dict.pop(self.mid, None)
@@ -157,7 +166,7 @@ class TaskListener(TaskConfig):
                 if self.mid in non_queued_up:
                     non_queued_up.remove(self.mid)
             await start_from_queued()
-            return  # Exit to prevent RClone/GDrive upload
+            return
 
         if one_path := await self.isOneFile(up_path):
             up_path = one_path
@@ -178,7 +187,12 @@ class TaskListener(TaskConfig):
                 LOGGER.info(f"Added to Queue/Upload: {self.name} (MID: {self.mid})")
                 async with task_dict_lock:
                     task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
-                await event.wait()
+                try:
+                    await wait_for(event.wait(), timeout=300)  # 5-minute queue timeout
+                except AsyncTimeoutError:
+                    LOGGER.error(f"Queue timeout for MID: {self.mid}")
+                    await self.onUploadError("Upload queue timeout.")
+                    return
                 async with task_dict_lock:
                     if self.mid not in task_dict:
                         return
@@ -195,7 +209,17 @@ class TaskListener(TaskConfig):
             tg = TgUploader(self, up_dir, size)
             async with task_dict_lock:
                 task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
-            await gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size))
+            try:
+                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
+                LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
+            except AsyncTimeoutError:
+                LOGGER.error(f"Upload timeout for MID: {self.mid}")
+                await self.onUploadError("Upload timed out after 10 minutes.")
+                return
+            except Exception as e:
+                LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
+                await self.onUploadError(f"Upload failed: {str(e)}")
+                return
         elif not self.isLeech and self.isGofile:
             LOGGER.info(f"GoFile Uploading: {self.name} (MID: {self.mid})")
             go = GoFileUploader(self)
@@ -234,6 +258,12 @@ class TaskListener(TaskConfig):
         images = choice(config_dict['IMAGE_COMPLETE'].split())
         TIME_ZONE_TITLE = config_dict['TIME_ZONE_TITLE']
 
+        # Thumbnail handling
+        thumb_path = ospath.join(self.dir, 'thumb.png')
+        if not await aiopath.exists(thumb_path):
+            LOGGER.info(f"Thumbnail not found at {thumb_path}, using default")
+            thumb_path = None  # Fallback to no thumbnail
+
         msg = f'<a href="https://t.me/maheshsirop"><b><i>Bot By Mahesh Kadali</b></i></a>\n'
         msg += f'<code>{escape(self.name)}</code>\n'
         msg += f'<b>┌ Size: </b>{size_str}\n'
@@ -262,7 +292,7 @@ class TaskListener(TaskConfig):
                 for index, (tlink, name) in enumerate(files.items(), start=1):
                     fmsg += f'{index}. <a href="{tlink}">{name}</a>\n'
                 msg += fmsg
-            uploadmsg = await sendingMessage(msg, self.message, images, buttons.build_menu(2))
+            uploadmsg = await sendingMessage(msg, self.message, images if not thumb_path else thumb_path, buttons.build_menu(2))
         else:
             msg += f'<b>├ Type: </b>{mime_type or "File"}\n'
             if mime_type == 'Folder':
@@ -276,7 +306,7 @@ class TaskListener(TaskConfig):
                 buttons.button_link('Cloud Link', link)
             elif rclonePath:
                 msg += f'\n\n<b>Path:</b> <code>{rclonePath}</code>'
-            uploadmsg = await sendingMessage(msg, self.message, images, buttons.build_menu(2))
+            uploadmsg = await sendingMessage(msg, self.message, images if not thumb_path else thumb_path, buttons.build_menu(2))
 
         if self.user_dict.get('enable_pm') and self.isSuperChat:
             await copyMessage(self.user_id, uploadmsg, buttons_scr.build_menu(2))

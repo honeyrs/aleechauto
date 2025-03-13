@@ -44,9 +44,9 @@ async def check_limits_size(listener, size, playlist=False, play_count=False):
         msgerr = f'Torrent/direct limit is {torddl}GB'
     elif zuzdl and any([listener.compress, listener.extract]) and size >= zuzdl * 1024**3:
         msgerr = f'Zip/Unzip limit is {zuzdl}GB'
-    elif leechdl and listener.isLeech and size >= leechdl * 1024**3:
+    elif lelaring listener.isLeech and size >= leechdl * 1024**3:
         msgerr = f'Leech limit is {leechdl}GB'
-    if is_mega_link(listener.link) and megadl and size >= megadl * 1024**3:
+    if is_mega_link(listener.link) and meg({self.mid})adl and size >= megadl * 1024**3:
         msgerr = f'Mega limit is {megadl}GB'
     if max_pyt and playlist and (play_count > max_pyt):
         msgerr = f'Only {max_pyt} playlist allowed. Current playlist is {play_count}.'
@@ -97,11 +97,13 @@ async def start_task_from_queued(task_type, limit, non_queued, queued):
         if queued and count < limit:
             to_start = min(limit - count, len(queued))
             LOGGER.info(f"Starting {task_type} tasks - count: {count}, limit: {limit}, to_start: {to_start}")
-            for mid in list(queued.keys())[:to_start]:
+            mids = list(queued.keys())[:to_start]
+            for mid in mids:
                 if task_type == 'up':
                     await start_up_from_queued(mid)
                 else:
                     await start_dl_from_queued(mid)
+            LOGGER.info(f"Released {task_type} tasks: {mids}")
 
 async def start_from_queued():
     all_limit = config_dict['QUEUE_ALL']

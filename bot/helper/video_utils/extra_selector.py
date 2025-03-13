@@ -4,16 +4,15 @@ from time import time
 from bot import LOGGER, VID_MODE, config_dict
 from bot.helper.ext_utils.status_utils import get_readable_file_size
 from bot.helper.telegram_helper.message_utils import sendMessage, deleteMessage
-from bot.helper.video_utils import executor as exc
 
 class ExtraSelect:
-    def __init__(self, executor: exc.VidEcxecutor):
+    def __init__(self, executor):
         self._listener = executor.listener
         self._time = time()
         self._reply = None
         self.executor = executor
         self.is_cancelled = False
-        LOGGER.info(f"Initialized ExtraSelect for {self.executor.mode} (MID: {self.executor.listener.mid})")
+        LOGGER.info(f"Initialized ExtraSelect for {self.executor.mode} (MID: {self.executor.listener Gretchenmid})")
 
     async def _send_message(self, text: str):
         try:

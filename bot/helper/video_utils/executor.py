@@ -52,7 +52,7 @@ class VidEcxecutor(FFProgress):
         self._processed_bytes = 0
         self._last_uploaded = 0
         self._start_time = time()
-        self.mid = self.listener.message.id  # Use listener's message ID
+        self.mid = self.listener.message.id
         LOGGER.info(f"Initialized VidEcxecutor for MID: {self.mid}, path: {self.path}")
 
     @staticmethod
@@ -99,7 +99,6 @@ class VidEcxecutor(FFProgress):
             return None
 
     async def _is_media_file(self, file_path):
-        """Check if a file is a video or audio file using mimetypes."""
         mime_type, _ = guess_type(file_path)
         return mime_type and (mime_type.startswith('video') or mime_type.startswith('audio'))
 
@@ -193,11 +192,13 @@ class VidEcxecutor(FFProgress):
                     queued_up[self.mid] = event
                     LOGGER.info(f"Added to Queue/Upload: {self.name}")
                     async with task_dict_lock:
-                        task_dict[self.mid] = QueueStatus(self.listener, self.size, self._gid, 'Up')  # Use self.listener instead of self
+                        task_dict[self.mid] = QueueStatus(self.listener, self.size, self._gid, 'Up')
             if add_to_queue:
+                LOGGER.info(f"Waiting for queue to proceed for MID: {self.mid}")
                 await event.wait()
                 async with task_dict_lock:
                     if self.mid not in task_dict:
+                        LOGGER.info(f"Task {self.mid} removed from task_dict before execution")
                         return None
                 LOGGER.info(f"Starting from Queued/Upload: {self.name}")
 
@@ -206,10 +207,13 @@ class VidEcxecutor(FFProgress):
 
         try:
             if self.mode == 'merge_rmaudio':
+                LOGGER.info(f"Starting merge_rmaudio for MID: {self.mid}")
                 result = await self._merge_and_rmaudio(file_list)
                 if result and not self.is_cancelled:
+                    LOGGER.info(f"Processing complete, uploading result for MID: {self.mid}")
                     uploaded_link = await self._upload_file(result)
                     if uploaded_link:
+                        LOGGER.info(f"Upload successful for MID: {self.mid}, notifying listener")
                         await self.listener.onUploadComplete(uploaded_link, self.size, {uploaded_link: self.name}, 1, 0)
                     else:
                         await self._cleanup()
@@ -235,7 +239,7 @@ class VidEcxecutor(FFProgress):
         async with task_dict_lock:
             task_dict.pop(self.mid, None)
             count = len(task_dict)
-        LOGGER.info(f"Task {self.mid} removed from task_dict")
+        LOGGER.info(f"Task {self.mid} removed from task_dict, remaining tasks: {count}")
         if count == 0:
             await self.clean()
         else:
@@ -266,7 +270,7 @@ class VidEcxecutor(FFProgress):
     async def _send_status(self, status='wait'):
         try:
             async with task_dict_lock:
-                task_dict[self.listener.mid] = FFMpegStatus(self.listener, self, self._gid, status)  # Use self.listener for status
+                task_dict[self.listener.mid] = FFMpegStatus(self.listener, self, self._gid, status)
             await sendStatusMessage(self.listener.message)
             LOGGER.info(f"Sent status update: {status} for MID: {self.mid}")
         except Exception as e:
@@ -334,6 +338,7 @@ class VidEcxecutor(FFProgress):
             return False
 
     async def _merge_and_rmaudio(self, file_list):
+        LOGGER.info(f"Fetching metadata for {file_list[0]} for MID: {self.mid}")
         streams = await get_metavideo(file_list[0])
         if not streams:
             LOGGER.error(f"No streams found in {file_list[0]} for MID: {self.mid}")
@@ -344,8 +349,10 @@ class VidEcxecutor(FFProgress):
         self._files = file_list
         self.size = sum(await gather(*[get_path_size(f) for f in file_list])) if file_list else 0
 
+        LOGGER.info(f"Starting stream selection for MID: {self.mid}")
         await self._start_handler(streams)
         try:
+            LOGGER.info(f"Waiting for stream selection event for MID: {self.mid}")
             await wait_for(self.event.wait(), timeout=180)
         except TimeoutError:
             LOGGER.error(f"Stream selection timed out for MID: {self.mid}")
@@ -364,6 +371,7 @@ class VidEcxecutor(FFProgress):
 
         try:
             if len(file_list) > 1:
+                LOGGER.info(f"Creating concat input file for MID: {self.mid}")
                 async with aiopen(input_file, 'w') as f:
                     await f.write('\n'.join([f"file '{f}'" for f in file_list]))
                 cmd = [FFMPEG_NAME, '-f', 'concat', '-safe', '0', '-i', input_file]
@@ -376,9 +384,11 @@ class VidEcxecutor(FFProgress):
                 cmd.extend(['-map', stream])
             cmd.extend(['-c', 'copy', self.outfile, '-y'])
 
+            LOGGER.info(f"Executing FFmpeg for MID: {self.mid}")
             if not await self._run_cmd(cmd, 'direct'):
                 await sendMessage("Merging failed due to FFmpeg error.", self.listener.message)
                 return None
+            LOGGER.info(f"FFmpeg processing completed for MID: {self.mid}")
             return await self._final_path()
         except Exception as e:
             LOGGER.error(f"Error in _merge_and_rmaudio: {e}", exc_info=True)

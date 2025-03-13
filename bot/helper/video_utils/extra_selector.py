@@ -33,14 +33,12 @@ class ExtraSelect:
         return f"{codec_type} ~ {codec_name} ({lang}){resolution}"
 
     def _is_language_match(self, lang, language_list):
-        """Check if a language tag matches any in the given list."""
         if not lang:
             return False
         lang = lang.lower()
         return any(tag.strip().lower() in lang for tag in language_list if isinstance(tag, str))
 
     def _get_language_lists(self):
-        """Load supported and always-remove languages from config_dict with fallbacks."""
         supported = config_dict.get('SUPPORTED_LANGUAGES', 'tel,te,తెలుగు,hin,hi').split(',')
         if not supported or not any(isinstance(tag, str) for tag in supported):
             LOGGER.warning("SUPPORTED_LANGUAGES invalid or missing, using default: tel,te,తెలుగు,hin,hi")

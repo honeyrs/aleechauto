@@ -5,6 +5,7 @@ from aioshutil import rmtree
 from ast import literal_eval
 from asyncio import create_subprocess_exec, gather, Event, Semaphore, wait_for, TimeoutError
 from asyncio.subprocess import PIPE
+from mimetypes import guess_type
 from natsort import natsorted
 from os import path as ospath, walk
 from time import time
@@ -14,7 +15,6 @@ from bot.helper.common import TaskConfig
 from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec, new_task
 from bot.helper.ext_utils.db_handler import DbManager
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target, clean_download
-from bot.helper.ext_utils.links_utils import get_document_type
 from bot.helper.ext_utils.media_utils import FFProgress
 from bot.helper.listeners import tasks_listener as task
 from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
@@ -100,6 +100,11 @@ class VidEcxecutor(FFProgress, TaskConfig):
             await rmtree(extract_dir, ignore_errors=True)
             return None
 
+    async def _is_media_file(self, file_path):
+        """Check if a file is a video or audio file using mimetypes."""
+        mime_type, _ = guess_type(file_path)
+        return mime_type and (mime_type.startswith('video') or mime_type.startswith('audio'))
+
     async def _get_files(self):
         file_list = []
         if self._metadata:
@@ -112,16 +117,16 @@ class VidEcxecutor(FFProgress, TaskConfig):
                     for dirpath, _, files in await sync_to_async(walk, extract_dir):
                         for file in natsorted(files):
                             file_path = ospath.join(dirpath, file)
-                            if (await get_document_type(file_path))[0]:
+                            if await self._is_media_file(file_path):
                                 file_list.append(file_path)
                                 LOGGER.info(f"Found media file: {file_path}")
-            elif (await get_document_type(self.path))[0]:
+            elif await self._is_media_file(self.path):
                 file_list.append(self.path)
         else:
             for dirpath, _, files in await sync_to_async(walk, self.path):
                 for file in natsorted(files):
                     file_path = ospath.join(dirpath, file)
-                    if (await get_document_type(file_path))[0]:
+                    if await self._is_media_file(file_path):
                         file_list.append(file_path)
                         LOGGER.info(f"Found media file: {file_path}")
         self.size = sum(await gather(*[get_path_size(f) for f in file_list])) if file_list else 0
@@ -175,7 +180,7 @@ class VidEcxecutor(FFProgress, TaskConfig):
         LOGGER.info(f"Executing {self.mode} with name: {self.name} for MID: {self.mid}")
         file_list = await self._get_files()
         if not file_list:
-            await sendMessage("No valid video files found.", self.listener.message)
+            await sendMessage("No valid video or audio files found.", self.listener.message)
             await self._cleanup()
             await self.listener.onUploadError("No files to process or upload.")
             return None
@@ -252,7 +257,7 @@ class VidEcxecutor(FFProgress, TaskConfig):
 
         await clean_download(self.path)
         if config_dict.get('INCOMPLETE_TASK_NOTIFIER') and DATABASE_URL:
-            await DbManager().rm_complete_task(self.listener.message.link)
+            await Dba await DbManager().rm_complete_task(self.listener.message.link)
 
     @new_task
     async def _start_handler(self, *args):

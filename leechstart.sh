@@ -8,5 +8,5 @@ echo yes | pip3 install -r requirements.txt
 echo yes | sudo docker container prune
 #echo yes | sudo docker image prune -a
 sudo dockerd
-sudo docker build . -t aleech
-sudo docker run -p 61:61 aleech
+sudo docker build . -t aleechauto
+sudo docker run -p 61:61 aleechauto

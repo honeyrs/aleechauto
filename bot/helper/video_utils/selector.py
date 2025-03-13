@@ -1,5 +1,5 @@
 from __future__ import annotations
-from asyncio import Event, wait_for
+from asyncio import Event, wait_for, TimeoutError
 from time import time
 
 from bot import VID_MODE, LOGGER
@@ -40,10 +40,11 @@ class SelectMode:
         LOGGER.info(f"Starting get_buttons for user {self.listener.user_id}")
         try:
             await self.list_buttons()
-            await wait_for(self._event.wait(), timeout=10)  # Short timeout for auto-proceed
-        except TimeoutError:
-            LOGGER.info(f"Auto-proceeding after timeout for user {self.listener.user_id}")
-            self._event.set()
+            try:
+                await wait_for(self._event.wait(), timeout=10)  # Short timeout for auto-proceed
+            except TimeoutError:
+                LOGGER.info(f"Auto-proceeding after timeout for user {self.listener.user_id}")
+                self._event.set()  # Ensure event is set for downstream logic
         except Exception as e:
             LOGGER.error(f"Error in get_buttons: {e}", exc_info=True)
             self.is_cancelled = True

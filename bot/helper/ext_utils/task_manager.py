@@ -105,24 +105,32 @@ async def start_task_from_queued(task_type, limit, non_queued, queued):
 
 async def start_from_queued():
     all_limit, dl_limit, up_limit = config_dict['QUEUE_ALL'], config_dict['QUEUE_DOWNLOAD'], config_dict['QUEUE_UPLOAD']
+    LOGGER.info(f"start_from_queued called - all_limit: {all_limit}, dl_limit: {dl_limit}, up_limit: {up_limit}, queued_up: {list(queued_up.keys())}, non_queued_up: {non_queued_up}")
 
     if all_limit:
         async with queue_dict_lock:
             dl, up = len(non_queued_dl), len(non_queued_up)
             all_ = dl + up
+            LOGGER.info(f"Queue stats - dl: {dl}, up: {up}, all: {all_}")
             if all_ < all_limit:
                 if queued_up and (not up_limit or up < up_limit):
+                    LOGGER.info(f"Processing queued_up tasks")
                     await start_task_from_queued('up', min(all_limit - all_, up_limit or all_limit), non_queued_up, queued_up)
                 if queued_dl and (not dl_limit or dl < dl_limit):
+                    LOGGER.info(f"Processing queued_dl tasks")
                     await start_task_from_queued('dl', min(all_limit - all_, dl_limit or all_limit), non_queued_dl, queued_dl)
         return
 
     if up_limit:
+        LOGGER.info(f"Processing queued_up with up_limit: {up_limit}")
         await start_task_from_queued('up', up_limit, non_queued_up, queued_up)
     else:
+        LOGGER.info(f"Processing queued_up with no limit")
         await start_task_from_queued('up', float('inf'), non_queued_up, queued_up)
 
     if dl_limit:
+        LOGGER.info(f"Processing queued_dl with dl_limit: {dl_limit}")
         await start_task_from_queued('dl', dl_limit, non_queued_dl, queued_dl)
     else:
+        LOGGER.info(f"Processing queued_dl with no limit")
         await start_task_from_queued('dl', float('inf'), non_queued_dl, queued_dl)

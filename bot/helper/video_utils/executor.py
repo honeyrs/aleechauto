@@ -3,7 +3,7 @@ from aiofiles import open as aiopen
 from aiofiles.os import path as aiopath, makedirs
 from aioshutil import rmtree
 from ast import literal_eval
-from asyncio import create_subprocess_exec, gather, Event, Semaphore, wait_for, TimeoutError
+from asyncio import create_subprocess_exec, gather, Event, Semaphore, wait_for, TimeoutError as AsyncTimeoutError
 from asyncio.subprocess import PIPE
 from mimetypes import guess_type
 from natsort import natsorted
@@ -153,7 +153,7 @@ class VidEcxecutor(FFProgress):
                     raise ValueError("Upload failed: No valid message returned")
                 LOGGER.info(f"Upload completed for MID: {self.mid}: {file_path}")
                 return self._send_msg.link
-            except TimeoutError:
+            except AsyncTimeoutError:
                 LOGGER.error(f"Upload timed out for MID: {self.mid}: {file_path}")
                 self.is_cancelled = True
                 await self.listener.onUploadError("Upload timed out after 10 minutes")
@@ -182,7 +182,7 @@ class VidEcxecutor(FFProgress):
             await self.listener.onUploadError("No files to process or upload.")
             return None
 
-        # Queue management
+        # Queue management with timeout
         add_to_queue, event = False, None
         if config_dict.get('QUEUE_ALL') or config_dict.get('QUEUE_COMPLETE'):
             async with queue_dict_lock:
@@ -196,12 +196,19 @@ class VidEcxecutor(FFProgress):
                         task_dict[self.mid] = QueueStatus(self.listener, self.size, self._gid, 'Up')
             if add_to_queue:
                 LOGGER.info(f"Waiting for queue to proceed for MID: {self.mid}")
-                await event.wait()
-                async with task_dict_lock:
-                    if self.mid not in task_dict:
-                        LOGGER.info(f"Task {self.mid} removed from task_dict before execution")
-                        return None
-                LOGGER.info(f"Starting from Queued/Upload: {self.name}")
+                try:
+                    await wait_for(event.wait(), timeout=60)  # 60-second timeout
+                    async with task_dict_lock:
+                        if self.mid not in task_dict:
+                            LOGGER.info(f"Task {self.mid} removed from task_dict before execution")
+                            return None
+                    LOGGER.info(f"Starting from Queued/Upload: {self.name}")
+                except AsyncTimeoutError:
+                    LOGGER.warning(f"Queue wait timed out for MID: {self.mid}, proceeding anyway")
+                    async with queue_dict_lock:
+                        if self.mid in queued_up:
+                            queued_up[self.mid].set()
+                            del queued_up[self.mid]
         else:
             LOGGER.info(f"Queue bypassed due to config for MID: {self.mid}")
 
@@ -357,7 +364,7 @@ class VidEcxecutor(FFProgress):
         try:
             LOGGER.info(f"Waiting for stream selection event for MID: {self.mid}")
             await wait_for(self.event.wait(), timeout=180)
-        except TimeoutError:
+        except AsyncTimeoutError:
             LOGGER.error(f"Stream selection timed out for MID: {self.mid}")
             self.is_cancelled = True
             await self._cleanup()

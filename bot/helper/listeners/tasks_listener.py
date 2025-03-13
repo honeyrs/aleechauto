@@ -172,7 +172,8 @@ class TaskListener(TaskConfig):
         async with queue_dict_lock:
             non_queued_up.add(self.mid)
 
-        # Trigger queue processing after VidEcxecutor
+        # Trigger queue processing after VidEcxecutor with debug
+        LOGGER.info(f"Triggering start_from_queued for MID: {self.mid}, queued_up: {list(queued_up.keys())}")
         await start_from_queued()
 
         size = await get_path_size(up_dir)

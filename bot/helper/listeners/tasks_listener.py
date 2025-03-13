@@ -151,42 +151,34 @@ class TaskListener(TaskConfig):
 
         up_dir, self.name = ospath.split(up_path)
         size = await get_path_size(up_dir)
-        if self.isLeech:
+
+        # Handle leeching only if VidEcxecutor didn’t upload
+        if self.isLeech and not (self.vidMode and up_path):  # Skip if VidEcxecutor already uploaded
             o_files, m_size = [], []
             if not self.compress:
                 result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
                 if not result:
                     return
+            LOGGER.info(f"Leeching with o_files: {o_files}, m_size: {m_size}")
 
-        # Queue management for upload
-        add_to_queue, event = await check_running_tasks(self.mid, "up")
-        if add_to_queue:
-            LOGGER.info('Added to Queue/Upload: %s', self.name)
-            async with task_dict_lock:
-                task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
-            await event.wait()
-            async with task_dict_lock:
-                if self.mid not in task_dict:
-                    return
-            LOGGER.info('Start from Queued/Upload: %s', self.name)
-        async with queue_dict_lock:
-            non_queued_up.add(self.mid)
+            # Queue management for upload
+            add_to_queue, event = await check_running_tasks(self.mid, "up")
+            if add_to_queue:
+                LOGGER.info('Added to Queue/Upload: %s', self.name)
+                async with task_dict_lock:
+                    task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
+                await event.wait()
+                async with task_dict_lock:
+                    if self.mid not in task_dict:
+                        return
+                LOGGER.info('Start from Queued/Upload: %s', self.name)
+            async with queue_dict_lock:
+                non_queued_up.add(self.mid)
 
-        # Trigger queue processing after VidEcxecutor with debug
-        LOGGER.info(f"Triggering start_from_queued for MID: {self.mid}, queued_up: {list(queued_up.keys())}")
-        await start_from_queued()
+            LOGGER.info(f"Triggering start_from_queued for MID: {self.mid}, queued_up: {list(queued_up.keys())}")
+            await start_from_queued()
 
-        size = await get_path_size(up_dir)
-
-        if not self.isLeech and self.isGofile:
-            go = GoFileUploader(self)
-            async with task_dict_lock:
-                task_dict[self.mid] = GofileUploadStatus(self, go, size, gid)
-            await gather(update_status_message(self.message.chat.id), go.goUpload())
-            if go.is_cancelled:
-                return
-
-        if self.isLeech:
+            size = await get_path_size(up_dir)
             for s in m_size:
                 size -= s
             LOGGER.info('Leech Name: %s', self.name)
@@ -194,6 +186,13 @@ class TaskListener(TaskConfig):
             async with task_dict_lock:
                 task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
             await gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size))
+        elif not self.isLeech and self.isGofile:
+            go = GoFileUploader(self)
+            async with task_dict_lock:
+                task_dict[self.mid] = GofileUploadStatus(self, go, size, gid)
+            await gather(update_status_message(self.message.chat.id), go.goUpload())
+            if go.is_cancelled:
+                return
         elif is_gdrive_id(self.upDest):
             LOGGER.info('GDrive Uploading: %s', self.name)
             drive = gdUpload(self, up_path)

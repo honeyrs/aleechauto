@@ -44,9 +44,9 @@ async def check_limits_size(listener, size, playlist=False, play_count=False):
         msgerr = f'Torrent/direct limit is {torddl}GB'
     elif zuzdl and any([listener.compress, listener.extract]) and size >= zuzdl * 1024**3:
         msgerr = f'Zip/Unzip limit is {zuzdl}GB'
-    elif lelaring listener.isLeech and size >= leechdl * 1024**3:
+    elif leechdl and listener.isLeech and size >= leechdl * 1024**3:
         msgerr = f'Leech limit is {leechdl}GB'
-    if is_mega_link(listener.link) and meg({self.mid})adl and size >= megadl * 1024**3:
+    if is_mega_link(listener.link) and megadl and size >= megadl * 1024**3:
         msgerr = f'Mega limit is {megadl}GB'
     if max_pyt and playlist and (play_count > max_pyt):
         msgerr = f'Only {max_pyt} playlist allowed. Current playlist is {play_count}.'

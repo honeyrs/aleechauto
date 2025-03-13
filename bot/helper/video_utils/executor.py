@@ -136,7 +136,7 @@ class VidEcxecutor(FFProgress):
             async with task_dict_lock:
                 task_dict[self.listener.mid] = QueueStatus(self.listener, self.size, self._gid, 'Up')
             try:
-                await wait_for(event.wait(), timeout=300)  # 5-minute timeout for queue
+                await wait_for(event.wait(), timeout=300)
             except AsyncTimeoutError:
                 LOGGER.error(f"Queue timeout for MID: {self.listener.mid}")
                 await self._cleanup()
@@ -251,13 +251,18 @@ class VidEcxecutor(FFProgress):
         self._files = file_list
         self.size = sum(await gather(*[get_path_size(f) for f in file_list])) if file_list else 0
 
-        await self._start_handler(streams)
         try:
+            await self._start_handler(streams)
             await wait_for(self.event.wait(), timeout=180)
         except AsyncTimeoutError:
             LOGGER.error(f"Stream selection timed out for MID: {self.listener.mid}")
             await self._cleanup()
             await self.listener.onUploadError("Stream selection timed out.")
+            return None
+        except Exception as e:
+            LOGGER.error(f"Stream handler error for MID: {self.listener.mid}: {e}", exc_info=True)
+            await self._cleanup()
+            await self.listener.onUploadError("Stream selection failed.")
             return None
 
         if self.is_cancelled:

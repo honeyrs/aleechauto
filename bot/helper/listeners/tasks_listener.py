@@ -149,7 +149,7 @@ class TaskListener(TaskConfig):
             async with task_dict_lock:
                 task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
             try:
-                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload([], [])), timeout=600)  # 10-minute timeout
+                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload([], [])), timeout=600)
                 LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
             except AsyncTimeoutError:
                 LOGGER.error(f"Upload timeout for MID: {self.mid}")
@@ -188,7 +188,7 @@ class TaskListener(TaskConfig):
                 async with task_dict_lock:
                     task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
                 try:
-                    await wait_for(event.wait(), timeout=300)  # 5-minute queue timeout
+                    await wait_for(event.wait(), timeout=300)
                 except AsyncTimeoutError:
                     LOGGER.error(f"Queue timeout for MID: {self.mid}")
                     await self.onUploadError("Upload queue timeout.")
@@ -258,11 +258,10 @@ class TaskListener(TaskConfig):
         images = choice(config_dict['IMAGE_COMPLETE'].split())
         TIME_ZONE_TITLE = config_dict['TIME_ZONE_TITLE']
 
-        # Thumbnail handling
         thumb_path = ospath.join(self.dir, 'thumb.png')
         if not await aiopath.exists(thumb_path):
             LOGGER.info(f"Thumbnail not found at {thumb_path}, using default")
-            thumb_path = None  # Fallback to no thumbnail
+            thumb_path = None
 
         msg = f'<a href="https://t.me/maheshsirop"><b><i>Bot By Mahesh Kadali</b></i></a>\n'
         msg += f'<code>{escape(self.name)}</code>\n'

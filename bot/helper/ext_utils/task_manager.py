@@ -55,30 +55,29 @@ async def check_limits_size(listener, size, playlist=False, play_count=False):
     return msgerr
 
 async def check_running_tasks(mid: int, state='dl'):
-    all_limit = config_dict.get('QUEUE_ALL', 0)  # Default to 0 (no limit) if not set
-    state_limit = config_dict.get('QUEUE_DOWNLOAD', 100) if state == 'dl' else config_dict.get('QUEUE_UPLOAD', 2)  # High default for downloads, keep uploads at 2
+    all_limit = config_dict.get('QUEUE_ALL', 0)  # No overall limit by default
+    state_limit = config_dict.get('QUEUE_DOWNLOAD', 0) if state == 'dl' else config_dict.get('QUEUE_UPLOAD', 2)  # No download limit, 2 for uploads
     event = None
     is_over_limit = False
-    if all_limit or state_limit:
-        async with queue_dict_lock:
-            if state == 'up' and mid in non_queued_dl:
-                non_queued_dl.remove(mid)
-            dl_count, up_count = len(non_queued_dl), len(non_queued_up)
-            # Only enforce limits if explicitly set and exceeded
-            is_over_limit = (all_limit and dl_count + up_count >= all_limit) or \
-                            (state_limit and ((state == 'dl' and dl_count >= state_limit) or (state == 'up' and up_count >= state_limit)))
-            if is_over_limit:
-                event = Event()
-                if state == 'dl':
-                    queued_dl[mid] = event
-                else:
-                    queued_up[mid] = event
+    async with queue_dict_lock:
+        if state == 'up' and mid in non_queued_dl:
+            non_queued_dl.remove(mid)
+        dl_count, up_count = len(non_queued_dl), len(non_queued_up)
+        # Only enforce limits if explicitly set and exceeded
+        is_over_limit = (all_limit > 0 and dl_count + up_count >= all_limit) or \
+                        (state_limit > 0 and ((state == 'dl' and dl_count >= state_limit) or (state == 'up' and up_count >= state_limit)))
+        if is_over_limit:
+            event = Event()
+            if state == 'dl':
+                queued_dl[mid] = event
             else:
-                if state == 'dl':
-                    non_queued_dl.add(mid)  # Allow download to start immediately
-                else:
-                    non_queued_up.add(mid)
-            LOGGER.info(f"Checking {state} tasks - MID: {mid}, dl_count: {dl_count}, up_count: {up_count}, all_limit: {all_limit}, state_limit: {state_limit}, is_over_limit: {is_over_limit}")
+                queued_up[mid] = event
+        else:
+            if state == 'dl':
+                non_queued_dl.add(mid)  # Start download immediately
+            else:
+                non_queued_up.add(mid)  # Start upload immediately
+        LOGGER.info(f"Checking {state} tasks - MID: {mid}, dl_count: {dl_count}, up_count: {up_count}, all_limit: {all_limit}, state_limit: {state_limit}, is_over_limit: {is_over_limit}")
     return is_over_limit, event
 
 async def start_dl_from_queued(mid: int):
@@ -87,7 +86,7 @@ async def start_dl_from_queued(mid: int):
             LOGGER.info(f"Releasing queued download task MID: {mid}")
             queued_dl[mid].set()
             del queued_dl[mid]
-            non_queued_dl.add(mid)  # Move to active downloads
+            non_queued_dl.add(mid)
     await sleep(0.5)
 
 async def start_up_from_queued(mid: int):
@@ -102,7 +101,7 @@ async def start_up_from_queued(mid: int):
 async def start_task_from_queued(task_type, limit, non_queued, queued):
     async with queue_dict_lock:
         count = len(non_queued)
-        if queued and (limit == 0 or count < limit):  # If limit is 0 (no limit) or not reached
+        if queued and (limit == 0 or count < limit):  # No limit or room available
             to_start = len(queued) if limit == 0 else min(limit - count, len(queued))
             LOGGER.info(f"Starting {task_type} tasks - count: {count}, limit: {limit}, to_start: {to_start}")
             mids = list(queued.keys())[:to_start]
@@ -114,26 +113,22 @@ async def start_task_from_queued(task_type, limit, non_queued, queued):
             LOGGER.info(f"Released {task_type} tasks: {mids}")
 
 async def start_from_queued():
-    all_limit = config_dict.get('QUEUE_ALL', 0)  # No limit by default
-    dl_limit = config_dict.get('QUEUE_DOWNLOAD', 100)  # High default to allow many downloads
-    up_limit = config_dict.get('QUEUE_UPLOAD', 2)  # Keep upload limit reasonable
+    all_limit = config_dict.get('QUEUE_ALL', 0)
+    dl_limit = config_dict.get('QUEUE_DOWNLOAD', 0)
+    up_limit = config_dict.get('QUEUE_UPLOAD', 2)
     LOGGER.info(f"start_from_queued called - all_limit: {all_limit}, dl_limit: {dl_limit}, up_limit: {up_limit}, queued_up: {list(queued_up.keys())}, non_queued_up: {non_queued_up}")
-
     async with queue_dict_lock:
         dl_count, up_count = len(non_queued_dl), len(non_queued_up)
         all_count = dl_count + up_count
         LOGGER.info(f"Queue stats - dl: {dl_count}, up: {up_count}, all: {all_count}")
-
-    if all_limit and all_count >= all_limit:
+    if all_limit > 0 and all_count >= all_limit:
         LOGGER.info("All limit reached, no tasks started")
         return
-
-    if up_limit:
+    if up_limit > 0:
         await start_task_from_queued('up', up_limit, non_queued_up, queued_up)
     elif queued_up:
-        await start_task_from_queued('up', 0, non_queued_up, queued_up)  # No limit for uploads if not set
-
-    if dl_limit:
+        await start_task_from_queued('up', 0, non_queued_up, queued_up)
+    if dl_limit > 0:
         await start_task_from_queued('dl', dl_limit, non_queued_dl, queued_dl)
     elif queued_dl:
-        await start_task_from_queued('dl', 0, non_queued_dl, queued_dl)  # No limit for downloads if not set
+        await start_task_from_queued('dl', 0, non_queued_dl, queued_dl)

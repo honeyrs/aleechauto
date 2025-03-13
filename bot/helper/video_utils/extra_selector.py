@@ -12,7 +12,7 @@ class ExtraSelect:
         self._reply = None
         self.executor = executor
         self.is_cancelled = False
-        LOGGER.info(f"Initialized ExtraSelect for {self.executor.mode} (MID: {self.executor.listener Gretchenmid})")
+        LOGGER.info(f"Initialized ExtraSelect for {self.executor.mode} (MID: {self.executor.listener.mid})")
 
     async def _send_message(self, text: str):
         try:

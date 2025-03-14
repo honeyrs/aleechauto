@@ -1,4 +1,3 @@
-from __future__ import annotations
 from aiofiles.os import path as aiopath, rename as aiorename, makedirs
 from aioshutil import copy
 from asyncio import sleep, gather
@@ -15,7 +14,7 @@ from time import time
 from bot import bot, bot_dict, bot_lock, config_dict, DEFAULT_SPLIT_SIZE, LOGGER
 from bot.helper.ext_utils.bot_utils import sync_to_async, default_button
 from bot.helper.ext_utils.files_utils import clean_unwanted, clean_target, get_path_size, is_archive, get_base_name
-from bot.helper.ext_utils.media_utils import create_thumbnail, take_ss, get_document_type, get_media_info, get_audio_thumb, post_media_info, GenSS
+from bot.helper.ext_utils.media_utils import create_thumbnail, take_ss, get_document_type, get_media_info, get_audio_thumb, post_media_info
 from bot.helper.ext_utils.shortenurl import short_url
 from bot.helper.listeners import tasks_listener as task
 from bot.helper.stream_utils.file_properties import gen_link
@@ -55,7 +54,6 @@ class TgUploader:
         await self._msg_to_reply()
         corrupted_files = total_files = 0
 
-        # Use o_files if provided, otherwise walk the directory
         if o_files:
             files_to_upload = [(self._path, f) for f in o_files]
         else:
@@ -78,7 +76,7 @@ class TgUploader:
                     continue
                 if f_size == 0:
                     corrupted_files += 1
-                    LOGGER.error('%s size is zero, telegram don\'t upload zero size files', self._up_path)
+                    LOGGER.error(f'{self._up_path} size is zero, telegram don\'t upload zero size files')
                     continue
                 if self._is_cancelled:
                     return
@@ -98,17 +96,15 @@ class TgUploader:
                 if self._is_cancelled:
                     return
                 if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
-                    self._msgs_dict[self _
-
-_send_msg.link] = file_
+                    self._msgs_dict[self._send_msg.link] = file_  # Fixed line 101
                 await sleep(3)
             except Exception as err:
                 if isinstance(err, RetryError):
-                    LOGGER.info('Total Attempts: %s', err.last_attempt.attempt_number, exc_info=True)
+                    LOGGER.info(f'Total Attempts: {err.last_attempt.attempt_number}', exc_info=True)
                     corrupted_files += 1
                     self._is_corrupted = True
                     err = err.last_attempt.exception()
-                LOGGER.error('%s. Path: %s', err, self._up_path)
+                LOGGER.error(f'{err}. Path: {self._up_path}')
                 corrupted_files += 1
                 if self._is_cancelled:
                     return
@@ -132,14 +128,14 @@ _send_msg.link] = file_
         if total_files <= corrupted_files:
             await self._listener.onUploadError('Files Corrupted or unable to upload. Check logs!')
             return
-        LOGGER.info('Leech Completed: %s', self._listener.name)
+        LOGGER.info(f'Leech Completed: {self._listener.name}')
         await self._listener.onUploadComplete(None, self._size, self._msgs_dict, total_files, corrupted_files)
 
     @retry(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(4), retry=retry_if_exception_type(Exception))
     async def _upload_file(self, caption, file, force_document=False):
         if self._thumb and not await aiopath.exists(self._thumb):
             self._thumb = None
-        thumb, ss_image = self._thumb, None
+        thumb = self._thumb
         if self._is_cancelled:
             return
         try:
@@ -154,27 +150,10 @@ _send_msg.link] = file_
                     thumb = thumb_path
                 elif is_audio and not is_video:
                     thumb = await get_audio_thumb(self._up_path)
-            if is_video:
+            if is_video and not self._listener.as_doc:
                 duration = (await get_media_info(self._up_path))[0]
-                ss_image = await self._gen_ss(self._up_path)
-                if self._listener.screenShots:
-                    await self._send_screenshots()
                 if not thumb:
                     thumb = await create_thumbnail(self._up_path, duration)
-
-            if self._listener.as_doc or force_document or (not is_video and not is_audio and not is_image):
-                key = 'documents'
-                if self._is_cancelled:
-                    return
-                self._send_msg = await self._client.send_document(chat_id=self._send_msg.chat.id,
-                                                                  document=self._up_path,
-                                                                  thumb=thumb,
-                                                                  caption=caption,
-                                                                  disable_notification=True,
-                                                                  progress=self._upload_progress,
-                                                                  reply_to_message_id=self._send_msg.id)
-            elif is_video:
-                key = 'videos'
                 if thumb:
                     with Image.open(thumb) as img:
                         width, height = img.size
@@ -204,52 +183,18 @@ _send_msg.link] = file_
                                                                disable_notification=True,
                                                                progress=self._upload_progress,
                                                                reply_to_message_id=self._send_msg.id)
-            elif is_audio:
-                key = 'audios'
-                duration, artist, title = await get_media_info(self._up_path)
-                if self._is_cancelled:
-                    return
-                self._send_msg = await self._client.send_audio(chat_id=self._send_msg.chat.id,
-                                                               audio=self._up_path,
-                                                               caption=caption,
-                                                               duration=duration,
-                                                               performer=artist,
-                                                               title=title,
-                                                               thumb=thumb,
-                                                               disable_notification=True,
-                                                               progress=self._upload_progress,
-                                                               reply_to_message_id=self._send_msg.id)
             else:
-                key = 'photos'
                 if self._is_cancelled:
                     return
-                self._send_msg = await bot.send_photo(chat_id=self._send_msg.chat.id,
-                                                      photo=self._up_path,
-                                                      caption=caption,
-                                                      disable_notification=True,
-                                                      progress=self._upload_progress,
-                                                      reply_to_message_id=self._send_msg.id)
+                self._send_msg = await self._client.send_document(chat_id=self._send_msg.chat.id,
+                                                                  document=self._up_path,
+                                                                  thumb=thumb,
+                                                                  caption=caption,
+                                                                  disable_notification=True,
+                                                                  progress=self._upload_progress,
+                                                                  reply_to_message_id=self._send_msg.id)
             if self._is_cancelled:
                 return
-            await self._final_message(ss_image, bool(is_video or is_audio))
-            
-            await self._copy_Leech(self._listener.user_id, self._send_msg)
-            if self._listener.upDest:
-                await self._copy_Leech(self._listener.upDest, self._send_msg)
-
-            if not self._is_cancelled and self._media_group and (self._send_msg.video or self._send_msg.document):
-                if match := re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path):
-                    subkey = match.group(0)
-                    if subkey in self._media_dict[key].keys():
-                        self._media_dict[key][subkey].append(self._send_msg)
-                    else:
-                        self._media_dict[key][subkey] = [self._send_msg]
-                    msgs = self._media_dict[key][subkey]
-                    if len(msgs) == 10:
-                        await self._send_media_group(msgs, subkey, key)
-                    else:
-                        self._last_msg_in_group = True
-
             if not self._thumb and thumb:
                 await clean_target(thumb)
         except FloodWait as f:
@@ -259,10 +204,7 @@ _send_msg.link] = file_
             if not self._thumb and thumb:
                 await clean_target(thumb)
             err_type = 'RPCError: ' if isinstance(err, RPCError) else ''
-            LOGGER.error('%s%s. Path: %s', err_type, err, self._up_path)
-            if 'Telegram says: [400' in str(err) and key != 'documents':
-                LOGGER.error('Retrying As Document. Path: %s', self._up_path, exc_info=True)
-                return await self._upload_file(caption, file, True)
+            LOGGER.error(f'{err_type}{err}. Path: {self._up_path}')
             raise err
 
     async def _user_settings(self):
@@ -270,16 +212,6 @@ _send_msg.link] = file_
         self._cap_mode = self._listener.user_dict.get('caption_style', 'mono')
         self._log_title = self._listener.user_dict.get('log_title', False)
         self._send_pm = self._listener.user_dict.get('enable_pm', False) and (self._listener.isSuperChat or self._leech_log)
-        self._enable_ss = self._listener.user_dict.get('enable_ss', False)
-        self._user_caption = self._listener.user_dict.get('captions', False)
-        self._user_fnamecap = self._listener.user_dict.get('fnamecap', True)
-        if config_dict['AUTO_THUMBNAIL']:
-            for dirpath, _, files in await sync_to_async(walk, self._path):
-                for file in files:
-                    filepath = ospath.join(dirpath, file)
-                    if file.startswith('Thumb') and (await get_document_type(filepath))[-1]:
-                        self._thumb = filepath
-                        break
 
     @property
     def speed(self):
@@ -294,7 +226,7 @@ _send_msg.link] = file_
 
     async def cancel_task(self):
         self._is_cancelled = True
-        LOGGER.info('Cancelling Upload: %s', self._listener.name)
+        LOGGER.info(f'Cancelling Upload: {self._listener.name}')
         await self._listener.onUploadError('Upload stopped by user!')
         if hasattr(self, '_up_path') and await aiopath.exists(self._up_path):
             await clean_target(self._up_path)
@@ -334,18 +266,7 @@ _send_msg.link] = file_
                 caption = file
             case 'mono':
                 caption = f'<code>{file}</code>'
-        if self._user_caption:
-            caption = f'''{caption}\n\n{self._user_caption}''' if self._user_fnamecap else self._user_caption
         return caption
-
-    async def _gen_ss(self, vid_path):
-        if not self._enable_ss or self._is_cancelled:
-            return
-        ss = GenSS(self._listener.message, vid_path)
-        await ss.file_ss()
-        if ss.error:
-            return
-        return ss.rimage
 
     @handle_message
     async def _msg_to_reply(self):
@@ -355,22 +276,15 @@ _send_msg.link] = file_
                 self._send_msg: Message = await bot.send_photo(self._leech_log, photo=self._thumb, caption=caption)
             else:
                 self._send_msg: Message = await bot.send_message(self._leech_log, caption, disable_web_page_preview=True)
-            if config_dict['LEECH_INFO_PIN']:
-                await self._send_msg.pin(both_sides=True)
         else:
             self._send_msg: Message = await bot.get_messages(self._listener.message.chat.id, self._listener.mid)
             if not self._send_msg or not self._send_msg.chat:
                 self._send_msg = self._listener.message
-        if self._send_msg and self._log_title and self._listener.upDest:
-            await self._copy_Leech(self._listener.upDest, self._send_msg)
 
     @handle_message
     async def _send_media_group(self, msgs: list[Message], subkey: str, key: str):
         msgs_list = await msgs[0].reply_to_message.reply_media_group(media=self._get_input_media(subkey, key),
                                                                      quote=True, disable_notification=True)
-        await self._copy_media_group(self._listener.user_id, msgs_list)
-        if self._listener.upDest:
-            await self._copy_media_group(self._listener.upDest, msgs_list)
         for msg in msgs:
             self._msgs_dict.pop(msg.link, None)
             await deleteMessage(msg)
@@ -379,56 +293,6 @@ _send_msg.link] = file_
             for m in msgs_list:
                 self._msgs_dict[m.link] = m.caption.split('\n')[0] + ' ~ (Grouped)'
         self._send_msg = msgs_list[-1]
-
-    @handle_message
-    async def _send_screenshots(self):
-        if isinstance(self._listener.screenShots, str):
-            ss_nb = int(self._listener.screenShots)
-        else:
-            ss_nb = 10
-        outputs = await take_ss(self._up_path, ss_nb)
-        inputs = []
-        if outputs:
-            for m in outputs:
-                if await aiopath.exists(m):
-                    cap = m.rsplit('/', 1)[-1]
-                    inputs.append(InputMediaPhoto(m, cap))
-                else:
-                    outputs.remove(m)
-        if outputs:
-            msgs_list = await self._send_msg.reply_media_group(media=inputs, quote=True, disable_notification=True)
-            await self._copy_media_group(self._listener.user_id, msgs_list)
-            if self._listener.upDest:
-                await self._copy_media_group(self._listener.upDest, msgs_list)
-            self._send_msg = msgs_list[-1]
-            await gather(*[clean_target(m) for m in outputs])
-
-    @handle_message
-    async def _copy_media_group(self, chat_id: int, msgs: list[Message]):
-        captions = [self._caption_mode(msg.caption.split('\n')[0]) for msg in msgs]
-        await bot.copy_media_group(chat_id=chat_id, from_chat_id=msgs[0].chat.id, message_id=msgs[0].id, captions=captions)
-
-    @handle_message
-    async def _copy_Leech(self, chat_id: int, message: Message):
-        reply_markup = await default_button(message) if config_dict['SAVE_MESSAGE'] and self._listener.isSuperChat else message.reply_markup
-        return await message.copy(chat_id, disable_notification=True, reply_markup=reply_markup,
-                                  reply_to_message_id=message.reply_to_message.id if chat_id == message.chat.id else None)
-
-    @handle_message
-    async def _final_message(self, ss_image, media_info: bool=False):
-        self._buttons = ButtonMaker()
-        media_result = await post_media_info(self._up_path, self._size, ss_image) if media_info else None
-        await clean_target(ss_image)
-        if media_result:
-            self._buttons.button_link('Media Info', media_result)
-        if config_dict['SAVE_MESSAGE'] and self._listener.isSuperChat:
-            self._buttons.button_data('Save Message', 'save', 'footer')
-        for mode, link in zip(['Stream', 'Download'], await gen_link(self._send_msg)):
-            if link:
-                self._buttons.button_link(mode, await sync_to_async(short_url, link, self._listener.user_id), 'header')
-        self._send_msg = await bot.get_messages(self._send_msg.chat.id, self._send_msg.id)
-        if (buttons := self._buttons.build_menu(2)) and (cmsg := await self._send_msg.edit_reply_markup(buttons)):
-            self._send_msg = cmsg
 
     def _get_input_media(self, subkey: str, key: str):
         imlist = []

@@ -9,7 +9,7 @@ from time import time
 
 from bot import bot_loop, bot_name, task_dict, task_dict_lock, Intervals, aria2, config_dict, non_queued_up, non_queued_dl, queued_up, queued_dl, queue_dict_lock, LOGGER, DATABASE_URL, bot
 from bot.helper.common import TaskConfig
-from bot.helper.ext_utils.bot_utils import is_premium_user, UserDaily, default_button, sync_to_async, cmd_exec
+from bot.helper.ext_utils.bot_utils import is_premium_user, UserDaily, default_button, sync_to_async
 from bot.helper.ext_utils.db_handler import DbManager
 from bot.helper.ext_utils.files_utils import get_path_size, clean_download, clean_target, join_files
 from bot.helper.ext_utils.links_utils import is_magnet, is_url, get_link, is_media, is_gdrive_link, get_stream_link, is_gdrive_id
@@ -108,7 +108,7 @@ class TaskListener(TaskConfig):
                     non_queued_dl.remove(self.mid)
             await start_from_queued()
 
-        if self.join and await ai Wopath.isdir(up_path):
+        if self.join and await aiopath.isdir(up_path):
             await join_files(up_path)
 
         if self.extract:
@@ -144,18 +144,14 @@ class TaskListener(TaskConfig):
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
 
-            # Splitting logic after VidEcxecutor
             o_files, m_size = [], []
             split_size = 4 * 1024 * 1024 * 1024 if is_premium_user(self.user_id) else config_dict.get('DEFAULT_SPLIT_SIZE', 2 * 1024 * 1024 * 1024)
             if size > split_size and await aiopath.isfile(up_path):
                 LOGGER.info(f"Splitting merged file {self.name} (size: {size}) into parts of {split_size} bytes")
                 result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
-                if not result or len(o_files) <= 1 and m_size[0] > split_size:  # Fallback if proceedSplit fails
-                    LOGGER.warning(f"proceedSplit failed to split {self.name}, using FFmpeg fallback")
-                    o_files, m_size = await self._split_file(up_path, up_dir, split_size)
-                    if not o_files:
-                        await self.onUploadError(f"Failed to split {self.name} into parts.")
-                        return
+                if not result:
+                    await self.onUploadError(f"Failed to split {self.name} into parts.")
+                    return
             else:
                 o_files.append(self.name)
                 m_size.append(size)
@@ -197,12 +193,9 @@ class TaskListener(TaskConfig):
                 if size > split_size and await aiopath.isfile(up_path):
                     LOGGER.info(f"Splitting {self.name} (size: {size}) into parts of {split_size} bytes")
                     result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
-                    if not result or len(o_files) <= 1 and m_size[0] > split_size:  # Fallback if proceedSplit fails
-                        LOGGER.warning(f"proceedSplit failed to split {self.name}, using FFmpeg fallback")
-                        o_files, m_size = await self._split_file(up_path, up_dir, split_size)
-                        if not o_files:
-                            await self.onUploadError(f"Failed to split {self.name} into parts.")
-                            return
+                    if not result:
+                        await self.onUploadError(f"Failed to split {self.name} into parts.")
+                        return
                 else:
                     o_files.append(self.name)
                     m_size.append(size)
@@ -246,42 +239,6 @@ class TaskListener(TaskConfig):
                 LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
                 await self.onUploadError(f"Upload failed: {str(e)}")
                 return
-        # ... (rest of upload paths unchanged: Gofile, GDrive, RClone)
-
-    async def _split_file(self, file_path, up_dir, split_size):
-        """Fallback splitting using FFmpeg if proceedSplit fails."""
-        try:
-            duration = (await sync_to_async(cmd_exec, ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]))[0].strip()
-            duration = float(duration) if duration else 0
-            if not duration:
-                LOGGER.error(f"Could not determine duration for {file_path}")
-                return [], []
-
-            segment_time = int((split_size / (await get_path_size(file_path))) * duration)  # Rough estimate
-            base_name = ospath.splitext(self.name)[0]
-            o_files, m_size = [], []
-            i = 0
-            while True:
-                output_file = ospath.join(up_dir, f"{base_name}.part{i}.mkv")
-                cmd = ['ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0', '-segment_time', str(segment_time), '-f', 'segment', '-reset_timestamps', '1', output_file.replace('.mkv', '.%03d.mkv'), '-y']
-                _, stderr, rcode = await cmd_exec(cmd)
-                if rcode != 0:
-                    LOGGER.error(f"FFmpeg split failed: {stderr}")
-                    return [], []
-                for f in await listdir(up_dir):
-                    if f.startswith(f"{base_name}.part{i}.") and f.endswith('.mkv'):
-                        part_path = ospath.join(up_dir, f)
-                        part_size = await get_path_size(part_path)
-                        o_files.append(f)
-                        m_size.append(part_size)
-                if not o_files or o_files[-1] == self.name:  # No more splits
-                    break
-                i += 1
-            LOGGER.info(f"Split {file_path} into {o_files}")
-            return o_files, m_size
-        except Exception as e:
-            LOGGER.error(f"Split file error: {e}", exc_info=True)
-            return [], []
 
     async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:

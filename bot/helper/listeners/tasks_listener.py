@@ -146,13 +146,20 @@ class TaskListener(TaskConfig):
 
             # Splitting logic for large files
             o_files, m_size = [], []
-            split_size = 4 * 1024 * 1024 * 1024 if is_premium_user(self.user_id) else config_dict.get('DEFAULT_SPLIT_SIZE', 2 * 1024 * 1024 * 1024)
-            if size > split_size and await aiopath.isfile(up_path):
+            TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB in bytes
+            split_size = 4 * 1024 * 1024 * 1024 if is_premium_user(self.user_id) else TELEGRAM_LIMIT
+            if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
                 LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts of {split_size} bytes")
                 o_files, m_size = await self._split_file(up_path, up_dir, split_size)
                 if not o_files:
                     await self.onUploadError(f"Failed to split {self.name} into parts.")
                     return
+                # Verify each part is under 2GB
+                for f_size in m_size:
+                    if f_size > TELEGRAM_LIMIT:
+                        LOGGER.error(f"Split file size {f_size} exceeds Telegram limit of {TELEGRAM_LIMIT} bytes")
+                        await self.onUploadError(f"Split file exceeds Telegram 2GB limit.")
+                        return
             else:
                 o_files.append(self.name)
                 m_size.append(size)
@@ -259,35 +266,40 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path, up_dir, split_size):
         try:
-            duration = (await cmd_exec(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]))[0].strip()
-            duration = float(duration) if duration else 0
-            if not duration:
-                LOGGER.error(f"Could not determine duration for {file_path}")
+            TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB
+            file_size = await get_path_size(file_path)
+            if file_size <= TELEGRAM_LIMIT:
+                return [ospath.basename(file_path)], [file_size]
+
+            base_name = ospath.splitext(self.name)[0]
+            output_pattern = ospath.join(up_dir, f"{base_name}_part%d.mkv")
+            cmd = [
+                'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
+                '-f', 'segment', '-segment_format', 'matroska',
+                '-fs', str(min(split_size, TELEGRAM_LIMIT)),  # Ensure parts are ≤ 2GB
+                output_pattern, '-y'
+            ]
+            _, stderr, rcode = await cmd_exec(cmd)
+            if rcode != 0:
+                LOGGER.error(f"FFmpeg split failed: {stderr}")
                 return [], []
 
-            segment_time = int((split_size / (await get_path_size(file_path))) * duration)
-            base_name = ospath.splitext(self.name)[0]
             o_files, m_size = [], []
-            i = 0
-            while True:
-                output_file = ospath.join(up_dir, f"{base_name}.part{i}.mkv")
-                cmd = ['ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0', '-segment_time', str(segment_time), '-f', 'segment', '-reset_timestamps', '1', output_file.replace('.mkv', '.%03d.mkv'), '-y']
-                _, stderr, rcode = await cmd_exec(cmd)
-                if rcode != 0:
-                    LOGGER.error(f"FFmpeg split failed: {stderr}")
-                    return [], []
-                for f in await listdir(up_dir):
-                    if f.startswith(f"{base_name}.part{i}.") and f.endswith('.mkv'):
-                        part_path = ospath.join(up_dir, f)
-                        part_size = await get_path_size(part_path)
-                        if part_size <= split_size:
-                            o_files.append(f)
-                            m_size.append(part_size)
-                        else:
-                            LOGGER.warning(f"Part {f} exceeds {split_size} bytes, skipping")
-                if not o_files or o_files[-1] == self.name:
-                    break
-                i += 1
+            for f in await listdir(up_dir):
+                if f.startswith(f"{base_name}_part") and f.endswith('.mkv'):
+                    part_path = ospath.join(up_dir, f)
+                    part_size = await get_path_size(part_path)
+                    if part_size <= TELEGRAM_LIMIT:
+                        o_files.append(f)
+                        m_size.append(part_size)
+                    else:
+                        LOGGER.warning(f"Part {f} exceeds {TELEGRAM_LIMIT} bytes, skipping")
+                        await clean_target(part_path)
+
+            if not o_files:
+                LOGGER.error(f"No valid split files generated for {file_path}")
+                return [], []
+
             LOGGER.info(f"Split {file_path} into {o_files}")
             return o_files, m_size
         except Exception as e:

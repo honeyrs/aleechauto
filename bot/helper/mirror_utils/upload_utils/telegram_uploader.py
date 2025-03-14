@@ -182,7 +182,7 @@ class TgUploader:
                         self._up_path = new_path
                 if self._is_cancelled:
                     return
-                self._send_msg = await self._client.send_video(chat_id=self._send_msg.chat.id,
+                self._send_msg = await selfN._client.send_video(chat_id=self._send_msg.chat.id,
                                                                video=self._up_path,
                                                                caption=caption,
                                                                duration=duration,
@@ -285,7 +285,7 @@ class TgUploader:
         self._is_cancelled = True
         LOGGER.info('Cancelling Upload: %s', self._listener.name)
         await self._listener.onUploadError('Upload stopped by user!')
-        if hasattr(self, '_up_path') and await aiopath.exists(self._up_path):  # Minimal addition
+        if hasattr(self, '_up_path') and await aiopath.exists(self._up_path):
             await clean_target(self._up_path)
 
     async def _prepare_file(self, file_, dirpath):

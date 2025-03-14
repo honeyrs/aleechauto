@@ -22,9 +22,7 @@ from bot.helper.stream_utils.file_properties import gen_link
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import deleteMessage, handle_message
 
-
 LOGGER = getLogger(__name__)
-
 
 class TgUploader:
     def __init__(self, listener: task.TaskListener, path: str, size: int):
@@ -287,8 +285,9 @@ class TgUploader:
         self._is_cancelled = True
         LOGGER.info('Cancelling Upload: %s', self._listener.name)
         await self._listener.onUploadError('Upload stopped by user!')
+        if hasattr(self, '_up_path') and await aiopath.exists(self._up_path):  # Minimal addition
+            await clean_target(self._up_path)
 
-    # ================================================== UTILS ==================================================
     async def _prepare_file(self, file_, dirpath):
         caption = self._caption_mode(file_)
         if len(file_) > 60:
@@ -336,9 +335,7 @@ class TgUploader:
         if ss.error:
             return
         return ss.rimage
-    # ===========================================================================================================
 
-    # ================================================= MESSAGE =================================================
     @handle_message
     async def _msg_to_reply(self):
         if self._leech_log and self._leech_log != self._listener.message.chat.id:
@@ -360,7 +357,6 @@ class TgUploader:
     async def _send_media_group(self, msgs: list[Message], subkey: str, key: str):
         msgs_list = await msgs[0].reply_to_message.reply_media_group(media=self._get_input_media(subkey, key),
                                                                      quote=True, disable_notification=True)
-    #    if self._send_pm:
         await self._copy_media_group(self._listener.user_id, msgs_list)
         if self._listener.upDest:
             await self._copy_media_group(self._listener.upDest, msgs_list)
@@ -390,7 +386,6 @@ class TgUploader:
                     outputs.remove(m)
         if outputs:
             msgs_list = await self._send_msg.reply_media_group(media=inputs, quote=True, disable_notification=True)
-        #    if self._send_pm:
             await self._copy_media_group(self._listener.user_id, msgs_list)
             if self._listener.upDest:
                 await self._copy_media_group(self._listener.upDest, msgs_list)
@@ -434,4 +429,3 @@ class TgUploader:
                 input_media = InputMediaDocument(media=msg.document.file_id, caption=caption)
             imlist.append(input_media)
         return imlist
-    # ===========================================================================================================

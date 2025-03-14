@@ -1,348 +1,305 @@
-from aiofiles.os import listdir, path as aiopath, makedirs
-from aioshutil import move
-from asyncio import sleep, gather, wait_for, TimeoutError as AsyncTimeoutError
-from html import escape
-from os import path as ospath
-from random import choice
-from requests import utils as rutils
+from aiofiles.os import path as aiopath, rename as aiorename, makedirs
+from aioshutil import copy
+from asyncio import sleep, gather
+from logging import getLogger
+from natsort import natsorted
+from os import path as ospath, walk
+from PIL import Image
+from pyrogram.errors import FloodWait, RPCError
+from pyrogram.types import InputMediaVideo, InputMediaDocument, InputMediaPhoto, Message
+from re import match as re_match
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
 from time import time
 
-from bot import bot_loop, bot_name, task_dict, task_dict_lock, Intervals, aria2, config_dict, non_queued_up, non_queued_dl, queued_up, queued_dl, queue_dict_lock, LOGGER, DATABASE_URL, bot
-from bot.helper.common import TaskConfig
-from bot.helper.ext_utils.bot_utils import is_premium_user, UserDaily, default_button, sync_to_async
-from bot.helper.ext_utils.db_handler import DbManager
-from bot.helper.ext_utils.files_utils import get_path_size, clean_download, clean_target, join_files
-from bot.helper.ext_utils.links_utils import is_magnet, is_url, get_link, is_media, is_gdrive_link, get_stream_link, is_gdrive_id
+from bot import bot, bot_dict, bot_lock, config_dict, DEFAULT_SPLIT_SIZE, LOGGER
+from bot.helper.ext_utils.bot_utils import sync_to_async, default_button
+from bot.helper.ext_utils.files_utils import clean_unwanted, clean_target, get_path_size, is_archive, get_base_name
+from bot.helper.ext_utils.media_utils import create_thumbnail, take_ss, get_document_type, get_media_info, get_audio_thumb, post_media_info
 from bot.helper.ext_utils.shortenurl import short_url
-from bot.helper.ext_utils.status_utils import action, get_date_time, get_readable_file_size, get_readable_time
-from bot.helper.ext_utils.task_manager import start_from_queued, check_running_tasks
-from bot.helper.ext_utils.telegraph_helper import TelePost
-from bot.helper.mirror_utils.gdrive_utlis.upload import gdUpload
-from bot.helper.mirror_utils.rclone_utils.transfer import RcloneTransferHelper
-from bot.helper.mirror_utils.status_utils.gdrive_status import GdriveStatus
-from bot.helper.mirror_utils.status_utils.gofile_upload_status import GofileUploadStatus
-from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
-from bot.helper.mirror_utils.status_utils.rclone_status import RcloneStatus
-from bot.helper.mirror_utils.status_utils.telegram_status import TelegramStatus
-from bot.helper.mirror_utils.upload_utils.gofile_uploader import GoFileUploader
-from bot.helper.mirror_utils.upload_utils.telegram_uploader import TgUploader
+from bot.helper.stream_utils.file_properties import gen_link
 from bot.helper.telegram_helper.button_build import ButtonMaker
-from bot.helper.telegram_helper.message_utils import limit, sendCustom, sendMedia, sendMessage, auto_delete_message, sendSticker, sendFile, copyMessage, sendingMessage, update_status_message, delete_status
-from bot.helper.video_utils.executor import VidEcxecutor
+from bot.helper.telegram_helper.message_utils import deleteMessage, handle_message
 
-class TaskListener(TaskConfig):
-    def __init__(self):
-        super().__init__()
+LOGGER = getLogger(__name__)
 
-    @staticmethod
-    async def clean():
+class TgUploader:
+    def __init__(self, listener, path: str, size: int):  # Removed type hint to avoid circular import
+        self._last_uploaded = 0
+        self._processed_bytes = 0
+        self._listener = listener
+        self._path = path
+        self._start_time = time()
+        self._is_cancelled = False
+        self._thumb = self._listener.thumb or ospath.join('thumbnails', f'{self._listener.user_id}.jpg')
+        self._msgs_dict = {}
+        self._is_corrupted = False
+        self._size = size
+        self._media_dict = {'videos': {}, 'documents': {}}
+        self._last_msg_in_group = False
+        self._client = None
+        self._send_msg = None
+        self._up_path = ''
+        self._leech_log = config_dict['LEECH_LOG']
+
+    async def _upload_progress(self, current, _):
+        if self._is_cancelled:
+            self._client.stop_transmission()
+        chunk_size = current - self._last_uploaded
+        self._last_uploaded = current
+        self._processed_bytes += chunk_size
+
+    async def upload(self, o_files, m_size):
+        await self._user_settings()
+        await self._msg_to_reply()
+        corrupted_files = total_files = 0
+
+        if o_files:
+            files_to_upload = [(self._path, f) for f in o_files]
+        else:
+            files_to_upload = []
+            for dirpath, _, files in sorted(await sync_to_async(walk, self._path)):
+                if dirpath.endswith('/yt-dlp-thumb'):
+                    continue
+                for file_ in natsorted(files):
+                    files_to_upload.append((dirpath, file_))
+
+        for dirpath, file_ in files_to_upload:
+            self._up_path = ospath.join(dirpath, file_)
+            if file_.lower().endswith(tuple(self._listener.extensionFilter)) or file_.startswith('Thumb'):
+                if not file_.startswith('Thumb'):
+                    await clean_target(self._up_path)
+                continue
+            try:
+                f_size = await get_path_size(self._up_path)
+                if self._listener.seed and file_ in o_files and f_size in m_size:
+                    continue
+                if f_size == 0:
+                    corrupted_files += 1
+                    LOGGER.error(f'{self._up_path} size is zero, telegram don\'t upload zero size files')
+                    continue
+                if self._is_cancelled:
+                    return
+                caption = await self._prepare_file(file_, dirpath)
+                if self._last_msg_in_group:
+                    group_lists = [x for v in self._media_dict.values() for x in v.keys()]
+                    match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path)
+                    if not match or match and match.group(0) not in group_lists:
+                        for key, value in list(self._media_dict.items()):
+                            for subkey, msgs in list(value.items()):
+                                if len(msgs) > 1:
+                                    await self._send_media_group(msgs, subkey, key)
+                self._last_msg_in_group = False
+                self._last_uploaded = 0
+                await self._upload_file(caption, file_)
+                total_files += 1
+                if self._is_cancelled:
+                    return
+                if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
+                    self._msgs_dict[self._send_msg.link] = file_
+                await sleep(3)
+            except Exception as err:
+                if isinstance(err, RetryError):
+                    LOGGER.info(f'Total Attempts: {err.last_attempt.attempt_number}', exc_info=True)
+                    corrupted_files += 1
+                    self._is_corrupted = True
+                    err = err.last_attempt.exception()
+                LOGGER.error(f'{err}. Path: {self._up_path}')
+                corrupted_files += 1
+                if self._is_cancelled:
+                    return
+                continue
+            finally:
+                if not self._is_cancelled and await aiopath.exists(self._up_path) and (not self._listener.seed or self._listener.newDir or
+                    dirpath.endswith('/splited_files_mltb') or '/copied_mltb/' in self._up_path):
+                    await clean_target(self._up_path)
+
+        for key, value in list(self._media_dict.items()):
+            for subkey, msgs in list(value.items()):
+                if len(msgs) > 1:
+                    await self._send_media_group(msgs, subkey, key)
+        if self._is_cancelled:
+            return
+        if self._listener.seed and not self._listener.newDir:
+            await clean_unwanted(self._path)
+        if total_files == 0:
+            await self._listener.onUploadError(f"No files to upload or in blocked list ({', '.join(self._listener.extensionFilter[2:])})!")
+            return
+        if total_files <= corrupted_files:
+            await self._listener.onUploadError('Files Corrupted or unable to upload. Check logs!')
+            return
+        LOGGER.info(f'Leech Completed: {self._listener.name}')
+        await self._listener.onUploadComplete(None, self._size, self._msgs_dict, total_files, corrupted_files)
+
+    @retry(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(4), retry=retry_if_exception_type(Exception))
+    async def _upload_file(self, caption, file, force_document=False):
+        if self._thumb and not await aiopath.exists(self._thumb):
+            self._thumb = None
+        thumb = self._thumb
+        if self._is_cancelled:
+            return
         try:
-            if st := Intervals['status']:
-                for intvl in list(st.values()):
-                    intvl.cancel()
-            Intervals['status'].clear()
-            await gather(sync_to_async(aria2.purge), delete_status())
-        except:
-            pass
-
-    def removeFromSameDir(self):
-        if self.sameDir and self.mid in self.sameDir['tasks']:
-            self.sameDir['tasks'].remove(self.mid)
-            self.sameDir['total'] -= 1
-
-    async def onDownloadStart(self):
-        if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
-            await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
-
-    async def onDownloadComplete(self):
-        multi_links = False
-        if self.sameDir and self.mid in self.sameDir['tasks']:
-            while not (self.sameDir['total'] in [1, 0] or self.sameDir['total'] > 1 and len(self.sameDir['tasks']) > 1):
-                await sleep(0.5)
-
-        async with task_dict_lock:
-            if self.sameDir and self.sameDir['total'] > 1 and self.mid in self.sameDir['tasks']:
-                self.sameDir['tasks'].remove(self.mid)
-                self.sameDir['total'] -= 1
-                folder_name = self.sameDir['name']
-                spath = ospath.join(self.dir, folder_name)
-                des_path = ospath.join(f'{config_dict["DOWNLOAD_DIR"]}{list(self.sameDir["tasks"])[0]}', folder_name)
-                await makedirs(des_path, exist_ok=True)
-                for item in await listdir(spath):
-                    if item.endswith(('.aria2', '.!qB')):
-                        continue
-                    item_path = ospath.join(spath, item)
-                    if item in await listdir(des_path):
-                        await move(item_path, ospath.join(des_path, f'{self.mid}-{item}'))
-                    else:
-                        await move(item_path, ospath.join(des_path, item))
-                multi_links = True
-            task = task_dict[self.mid]
-            self.name = task.name()
-            gid = task.gid()
-        LOGGER.info(f"Download completed: {self.name} (MID: {self.mid})")
-        if multi_links:
-            await self.onUploadError('Downloaded! Waiting for other tasks.')
-            return
-
-        up_path = ospath.join(self.dir, self.name)
-        if not await aiopath.exists(up_path):
-            try:
-                files = await listdir(self.dir)
-                self.name = files[-1]
-                if self.name == 'yt-dlp-thumb':
-                    self.name = files[0]
-            except Exception as e:
-                await self.onUploadError(str(e))
-                return
-
-        await self.isOneFile(up_path)
-        await self.reName()
-
-        up_path = ospath.join(self.dir, self.name)
-        size = await get_path_size(up_path)
-
-        if not config_dict['QUEUE_ALL'] and not config_dict['QUEUE_COMPLETE']:
-            async with queue_dict_lock:
-                if self.mid in non_queued_dl:
-                    non_queued_dl.remove(self.mid)
-            await start_from_queued()
-
-        if self.join and await aiopath.isdir(up_path):
-            await join_files(up_path)
-
-        if self.extract:
-            up_path = await self.proceedExtract(up_path, size, gid)
-            if not up_path:
-                return
-            up_dir, self.name = ospath.split(up_path)
-            size = await get_path_size(up_dir)
-
-        if self.sampleVideo:
-            up_path = await self.generateSampleVideo(up_path, gid)
-            if not up_path:
-                return
-            up_dir, self.name = ospath.split(up_path)
-            size = await get_path_size(up_dir)
-
-        if self.compress:
-            if self.vidMode:
-                up_path = await VidEcxecutor(self, up_path, gid).execute()
-                if not up_path:
-                    return
-                self.seed = False
-            up_path = await self.proceedCompress(up_path, size, gid)
-            if not up_path:
-                return
-
-        if not self.compress and self.vidMode:
-            LOGGER.info(f"Processing video with VidEcxecutor for MID: {self.mid}")
-            up_path = await VidEcxecutor(self, up_path, gid).execute()
-            if not up_path:
-                return
-            self.seed = False
-            up_dir, self.name = ospath.split(up_path)
-            size = await get_path_size(up_dir)
-
-            o_files, m_size = [], []
-            split_size = 4 * 1024 * 1024 * 1024 if is_premium_user(self.user_id) else config_dict.get('DEFAULT_SPLIT_SIZE', 2 * 1024 * 1024 * 1024)
-            if size > split_size and await aiopath.isfile(up_path):
-                LOGGER.info(f"Splitting merged file {self.name} (size: {size}) into parts of {split_size} bytes")
-                result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
-                if not result:
-                    await self.onUploadError(f"Failed to split {self.name} into parts.")
-                    return
-            else:
-                o_files.append(self.name)
-                m_size.append(size)
-
-            LOGGER.info(f"Leeching {self.name} (MID: {self.mid}) with o_files: {o_files}, m_size: {m_size}")
-            tg = TgUploader(self, up_dir, size)
-            async with task_dict_lock:
-                task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
-            try:
-                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
-                LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
-            except AsyncTimeoutError:
-                LOGGER.error(f"Upload timeout for MID: {self.mid}")
-                await self.onUploadError("Upload timed out after 10 minutes.")
-                return
-            except Exception as e:
-                LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
-                await self.onUploadError(f"Upload failed: {str(e)}")
-                return
-            await clean_download(self.dir)
-            async with task_dict_lock:
-                task_dict.pop(self.mid, None)
-            async with queue_dict_lock:
-                if self.mid in non_queued_up:
-                    non_queued_up.remove(self.mid)
-            await start_from_queued()
-            return
-
-        if one_path := await self.isOneFile(up_path):
-            up_path = one_path
-
-        up_dir, self.name = ospath.split(up_path)
-        size = await get_path_size(up_dir)
-
-        if self.isLeech:
-            o_files, m_size = [], []
-            if not self.compress:
-                split_size = 4 * 1024 * 1024 * 1024 if is_premium_user(self.user_id) else config_dict.get('DEFAULT_SPLIT_SIZE', 2 * 1024 * 1024 * 1024)
-                if size > split_size and await aiopath.isfile(up_path):
-                    LOGGER.info(f"Splitting {self.name} (size: {size}) into parts of {split_size} bytes")
-                    result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
-                    if not result:
-                        await self.onUploadError(f"Failed to split {self.name} into parts.")
-                        return
+            async with bot_lock:
+                self._client = (bot_dict['USERBOT'] if bot_dict['IS_PREMIUM'] and await get_path_size(self._up_path) > DEFAULT_SPLIT_SIZE
+                                or bot_dict['USERBOT'] and config_dict['USERBOT_LEECH'] else bot)
+            is_video, is_audio, is_image = await get_document_type(self._up_path)
+            if not is_image and thumb is None:
+                file_name = ospath.splitext(file)[0]
+                thumb_path = ospath.join(self._path, 'yt-dlp-thumb', f'{file_name}.jpg')
+                if await aiopath.isfile(thumb_path):
+                    thumb = thumb_path
+                elif is_audio and not is_video:
+                    thumb = await get_audio_thumb(self._up_path)
+            if is_video and not self._listener.as_doc:
+                duration = (await get_media_info(self._up_path))[0]
+                if not thumb:
+                    thumb = await create_thumbnail(self._up_path, duration)
+                if thumb:
+                    with Image.open(thumb) as img:
+                        width, height = img.size
                 else:
-                    o_files.append(self.name)
-                    m_size.append(size)
-            LOGGER.info(f"Leeching with o_files: {o_files}, m_size: {m_size} for MID: {self.mid}")
-
-            add_to_queue, event = await check_running_tasks(self.mid, "up")
-            if add_to_queue:
-                LOGGER.info(f"Added to Queue/Upload: {self.name} (MID: {self.mid})")
-                async with task_dict_lock:
-                    task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
-                try:
-                    await wait_for(event.wait(), timeout=300)
-                except AsyncTimeoutError:
-                    LOGGER.error(f"Queue timeout for MID: {self.mid}")
-                    await self.onUploadError("Upload queue timeout.")
+                    width, height = 480, 320
+                if not self._up_path.upper().endswith(('.MKV', '.MP4')):
+                    dirpath, file_ = ospath.split(self._up_path)
+                    if self._listener.seed and not self._listener.newDir and not dirpath.endswith('/splited_files_mltb'):
+                        dirpath = ospath.join(dirpath, 'copied_mltb')
+                        await makedirs(dirpath, exist_ok=True)
+                        new_path = ospath.join(dirpath, f'{ospath.splitext(file_)[0]}.mp4')
+                        self._up_path = await copy(self._up_path, new_path)
+                    else:
+                        new_path = f'{ospath.splitext(self._up_path)[0]}.mp4'
+                        await aiorename(self._up_path, new_path)
+                        self._up_path = new_path
+                if self._is_cancelled:
                     return
-                async with task_dict_lock:
-                    if self.mid not in task_dict:
-                        return
-                LOGGER.info(f"Start from Queued/Upload: {self.name} (MID: {self.mid})")
-            async with queue_dict_lock:
-                non_queued_up.add(self.mid)
-
-            await start_from_queued()
-
-            size = await get_path_size(up_dir)
-            for s in m_size:
-                size -= s
-            LOGGER.info(f"Leech Name: {self.name} (MID: {self.mid})")
-            tg = TgUploader(self, up_dir, size)
-            async with task_dict_lock:
-                task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
-            try:
-                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
-                LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
-            except AsyncTimeoutError:
-                LOGGER.error(f"Upload timeout for MID: {self.mid}")
-                await self.onUploadError("Upload timed out after 10 minutes.")
+                self._send_msg = await self._client.send_video(chat_id=self._send_msg.chat.id,
+                                                               video=self._up_path,
+                                                               caption=caption,
+                                                               duration=duration,
+                                                               width=width,
+                                                               height=height,
+                                                               thumb=thumb,
+                                                               supports_streaming=True,
+                                                               disable_notification=True,
+                                                               progress=self._upload_progress,
+                                                               reply_to_message_id=self._send_msg.id)
+            else:
+                if self._is_cancelled:
+                    return
+                self._send_msg = await self._client.send_document(chat_id=self._send_msg.chat.id,
+                                                                  document=self._up_path,
+                                                                  thumb=thumb,
+                                                                  caption=caption,
+                                                                  disable_notification=True,
+                                                                  progress=self._upload_progress,
+                                                                  reply_to_message_id=self._send_msg.id)
+            if self._is_cancelled:
                 return
-            except Exception as e:
-                LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
-                await self.onUploadError(f"Upload failed: {str(e)}")
-                return
+            if not self._thumb and thumb:
+                await clean_target(thumb)
+        except FloodWait as f:
+            LOGGER.warning(f, exc_info=True)
+            await sleep(f.value * 1.2)
+        except Exception as err:
+            if not self._thumb and thumb:
+                await clean_target(thumb)
+            err_type = 'RPCError: ' if isinstance(err, RPCError) else ''
+            LOGGER.error(f'{err_type}{err}. Path: {self._up_path}')
+            raise err
 
-    async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):
-        if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
-            await DbManager().rm_complete_task(self.message.link)
+    async def _user_settings(self):
+        self._media_group = self._listener.user_dict.get('media_group', False) or ('media_group' not in self._listener.user_dict and config_dict['MEDIA_GROUP'])
+        self._cap_mode = self._listener.user_dict.get('caption_style', 'mono')
+        self._log_title = self._listener.user_dict.get('log_title', False)
+        self._send_pm = self._listener.user_dict.get('enable_pm', False) and (self._listener.isSuperChat or self._leech_log)
 
-        LOGGER.info(f"Task Done: {self.name} (MID: {self.mid})")
-        dt_date, dt_time = get_date_time(self.message)
-        buttons = ButtonMaker()
-        buttons_scr = ButtonMaker()
-        daily_size = size
-        size_str = get_readable_file_size(size)
-        reply_to = self.message.reply_to_message
-        images = choice(config_dict['IMAGE_COMPLETE'].split())
-        TIME_ZONE_TITLE = config_dict['TIME_ZONE_TITLE']
+    @property
+    def speed(self):
+        try:
+            return self._processed_bytes / (time() - self._start_time)
+        except:
+            return 0
 
-        thumb_path = ospath.join(self.dir, 'thumb.png')
-        if not await aiopath.exists(thumb_path):
-            LOGGER.info(f"Thumbnail not found at {thumb_path}, using default")
-            thumb_path = None
+    @property
+    def processed_bytes(self):
+        return self._processed_bytes
 
-        msg = f'<a href="https://t.me/satyamisme1"><b><i>Bot By satyamisme</b></i></a>\n'
-        msg += f'<code>{escape(self.name)}</code>\n'
-        msg += f'<b>┌ Size: </b>{size_str}\n'
+    async def cancel_task(self):
+        self._is_cancelled = True
+        LOGGER.info(f'Cancelling Upload: {self._listener.name}')
+        await self._listener.onUploadError('Upload stopped by user!')
+        if hasattr(self, '_up_path') and await aiopath.exists(self._up_path):
+            await clean_target(self._up_path)
 
-        if self.isLeech:
-            if config_dict['SOURCE_LINK']:
-                scr_link = get_link(self.message)
-                if is_magnet(scr_link):
-                    tele = TelePost(config_dict['SOURCE_LINK_TITLE'])
-                    mag_link = await sync_to_async(tele.create_post, f'<code>{escape(self.name)}<br>({size_str})</code><br>{scr_link}')
-                    buttons.button_link('Source Link', mag_link)
-                    buttons_scr.button_link('Source Link', mag_link)
-                elif is_url(scr_link):
-                    buttons.button_link('Source Link', scr_link)
-                    buttons_scr.button_link('Source Link', scr_link)
-            if self.user_dict.get('enable_pm') and self.isSuperChat:
-                buttons.button_link('View File(s)', f'http://t.me/{bot_name}')
-            msg += f'<b>├ Total Files: </b>{folders}\n'
-            if mime_type and mime_type != 0:
-                msg += f'<b>├ Corrupted Files: </b>{mime_type}\n'
-            msg += (f'<b>├ Elapsed: </b>{get_readable_time(time() - self.message.date.timestamp())}\n'
-                    f'<b>├ Cc: </b>{self.tag}\n'
-                    f'<b>└ Action: </b>{action(self.message)}\n\n')
-            if files:
-                fmsg = '<b>Leech File(s):</b>\n'
-                for index, (tlink, name) in enumerate(files.items(), start=1):
-                    fmsg += f'{index}. <a href="{tlink}">{name}</a>\n'
-                msg += fmsg
-            uploadmsg = await sendingMessage(msg, self.message, images if not thumb_path else thumb_path, buttons.build_menu(2))
+    async def _prepare_file(self, file_, dirpath):
+        caption = self._caption_mode(file_)
+        if len(file_) > 60:
+            if is_archive(file_):
+                name = get_base_name(file_)
+                ext = file_.split(name, 1)[1]
+            elif match := re_match(r'.+(?=\..+\.0*\d+$)|.+(?=\.part\d+\..+$)', file_):
+                name = match.group(0)
+                ext = file_.split(name, 1)[1]
+            elif len(fsplit := ospath.splitext(file_)) > 1:
+                name, ext = fsplit[0], fsplit[1]
+            else:
+                name, ext = file_, ''
+            name = name[:60 - len(ext)]
+            if self._listener.seed and not self._listener.newDir and not dirpath.endswith('/splited_files_mltb'):
+                dirpath = ospath.join(dirpath, 'copied_mltb')
+                await makedirs(dirpath, exist_ok=True)
+                new_path = ospath.join(dirpath, f'{name}{ext}')
+                self._up_path = await copy(self._up_path, new_path)
+            else:
+                new_path = ospath.join(dirpath, f'{name}{ext}')
+                await aiorename(self._up_path, new_path)
+                self._up_path = new_path
+        return caption
+
+    def _caption_mode(self, file):
+        match self._cap_mode:
+            case 'italic':
+                caption = f'<i>{file}</i>'
+            case 'bold':
+                caption = f'<b>{file}</b>'
+            case 'normal':
+                caption = file
+            case 'mono':
+                caption = f'<code>{file}</code>'
+        return caption
+
+    @handle_message
+    async def _msg_to_reply(self):
+        if self._leech_log and self._leech_log != self._listener.message.chat.id:
+            caption = f'<b>▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n{self._listener.name}\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬</b>'
+            if self._thumb and await aiopath.exists(self._thumb):
+                self._send_msg: Message = await bot.send_photo(self._leech_log, photo=self._thumb, caption=caption)
+            else:
+                self._send_msg: Message = await bot.send_message(self._leech_log, caption, disable_web_page_preview=True)
         else:
-            msg += f'<b>├ Type: </b>{mime_type or "File"}\n'
-            if mime_type == 'Folder':
-                if folders:
-                    msg += f'<b>├ SubFolders: </b>{folders}\n'
-                msg += f'<b>├ Files: </b>{files}\n'
-            msg += (f'<b>├ Elapsed: </b>{get_readable_time(time() - self.message.date.timestamp())}\n'
-                    f'<b>├ Cc: </b>{self.tag}\n'
-                    f'<b>└ Action: </b>{action(self.message)}\n')
-            if link:
-                buttons.button_link('Cloud Link', link)
-            elif rclonePath:
-                msg += f'\n\n<b>Path:</b> <code>{rclonePath}</code>'
-            uploadmsg = await sendingMessage(msg, self.message, images if not thumb_path else thumb_path, buttons.build_menu(2))
+            self._send_msg: Message = await bot.get_messages(self._listener.message.chat.id, self._listener.mid)
+            if not self._send_msg or not self._send_msg.chat:
+                self._send_msg = self._listener.message
 
-        if self.user_dict.get('enable_pm') and self.isSuperChat:
-            await copyMessage(self.user_id, uploadmsg, buttons_scr.build_menu(2))
-        if chat_id := config_dict.get('LEECH_LOG') if self.isLeech else config_dict.get('MIRROR_LOG'):
-            await copyMessage(chat_id, uploadmsg)
+    @handle_message
+    async def _send_media_group(self, msgs: list[Message], subkey: str, key: str):
+        msgs_list = await msgs[0].reply_to_message.reply_media_group(media=self._get_input_media(subkey, key),
+                                                                     quote=True, disable_notification=True)
+        for msg in msgs:
+            self._msgs_dict.pop(msg.link, None)
+            await deleteMessage(msg)
+        del self._media_dict[key][subkey]
+        if self._listener.isSuperChat or self._leech_log:
+            for m in msgs_list:
+                self._msgs_dict[m.link] = m.caption.split('\n')[0] + ' ~ (Grouped)'
+        self._send_msg = msgs_list[-1]
 
-        await clean_download(self.dir)
-        async with task_dict_lock:
-            task_dict.pop(self.mid, None)
-            count = len(task_dict)
-        if count == 0:
-            await self.clean()
-        else:
-            await update_status_message(self.message.chat.id)
-
-        async with queue_dict_lock:
-            if self.mid in non_queued_dl:
-                non_queued_dl.remove(self.mid)
-            if self.mid in non_queued_up:
-                non_queued_up.remove(self.mid)
-        await start_from_queued()
-
-        if self.isSuperChat and (stime := config_dict['AUTO_DELETE_UPLOAD_MESSAGE_DURATION']):
-            bot_loop.create_task(auto_delete_message(self.message, uploadmsg, reply_to, stime=stime))
-
-    async def onDownloadError(self, error, listfile=None):
-        LOGGER.error(f"Download error for MID: {self.mid}: {error}")
-        async with task_dict_lock:
-            task_dict.pop(self.mid, None)
-        await self.clean()
-        if self.isSuperChat and DATABASE_URL:
-            await DbManager().rm_complete_task(self.message.link)
-        await sendingMessage(f"Download failed: {error}", self.message, choice(config_dict['IMAGE_COMPLETE'].split()))
-        await gather(start_from_queued(), clean_download(self.dir))
-
-    async def onUploadError(self, error):
-        LOGGER.error(f"Upload error for MID: {self.mid}: {error}")
-        async with task_dict_lock:
-            task_dict.pop(self.mid, None)
-        await self.clean()
-        if self.isSuperChat and DATABASE_URL:
-            await DbManager().rm_complete_task(self.message.link)
-        await sendingMessage(f"Upload failed: {error}", self.message, choice(config_dict['IMAGE_COMPLETE'].split()))
-        await gather(start_from_queued(), clean_download(self.dir))
+    def _get_input_media(self, subkey: str, key: str):
+        imlist = []
+        for msg in self._media_dict[key][subkey]:
+            caption = self._caption_mode(msg.caption.split('\n')[0])
+            if key == 'videos':
+                input_media = InputMediaVideo(media=msg.video.file_id, caption=caption)
+            else:
+                input_media = InputMediaDocument(media=msg.document.file_id, caption=caption)
+            imlist.append(input_media)
+        return imlist

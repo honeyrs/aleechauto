@@ -54,58 +54,69 @@ class TgUploader:
         await self._user_settings()
         await self._msg_to_reply()
         corrupted_files = total_files = 0
-        for dirpath, _, files in sorted(await sync_to_async(walk, self._path)):
-            if dirpath.endswith('/yt-dlp-thumb'):
+
+        # Use o_files if provided, otherwise walk the directory
+        if o_files:
+            files_to_upload = [(self._path, f) for f in o_files]
+        else:
+            files_to_upload = []
+            for dirpath, _, files in sorted(await sync_to_async(walk, self._path)):
+                if dirpath.endswith('/yt-dlp-thumb'):
+                    continue
+                for file_ in natsorted(files):
+                    files_to_upload.append((dirpath, file_))
+
+        for dirpath, file_ in files_to_upload:
+            self._up_path = ospath.join(dirpath, file_)
+            if file_.lower().endswith(tuple(self._listener.extensionFilter)) or file_.startswith('Thumb'):
+                if not file_.startswith('Thumb'):
+                    await clean_target(self._up_path)
                 continue
-            for file_ in natsorted(files):
-                self._up_path = ospath.join(dirpath, file_)
-                if file_.lower().endswith(tuple(self._listener.extensionFilter)) or file_.startswith('Thumb'):
-                    if not file_.startswith('Thumb'):
-                        await clean_target(self._up_path)
+            try:
+                f_size = await get_path_size(self._up_path)
+                if self._listener.seed and file_ in o_files and f_size in m_size:
                     continue
-                try:
-                    f_size = await get_path_size(self._up_path)
-                    if self._listener.seed and file_ in o_files and f_size in m_size:
-                        continue
-                    if f_size == 0:
-                        corrupted_files += 1
-                        LOGGER.error('%s size is zero, telegram don\'t upload zero size files', self._up_path)
-                        continue
-                    if self._is_cancelled:
-                        return
-                    caption = await self._prepare_file(file_, dirpath)
-                    if self._last_msg_in_group:
-                        group_lists = [x for v in self._media_dict.values() for x in v.keys()]
-                        match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path)
-                        if not match or match and match.group(0) not in group_lists:
-                            for key, value in list(self._media_dict.items()):
-                                for subkey, msgs in list(value.items()):
-                                    if len(msgs) > 1:
-                                        await self._send_media_group(msgs, subkey, key)
-                    self._last_msg_in_group = False
-                    self._last_uploaded = 0
-                    await self._upload_file(caption, file_)
-                    total_files += 1
-                    if self._is_cancelled:
-                        return
-                    if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
-                        self._msgs_dict[self._send_msg.link] = file_
-                    await sleep(3)
-                except Exception as err:
-                    if isinstance(err, RetryError):
-                        LOGGER.info('Total Attempts: %s', err.last_attempt.attempt_number, exc_info=True)
-                        corrupted_files += 1
-                        self._is_corrupted = True
-                        err = err.last_attempt.exception()
-                    LOGGER.error('%s. Path: %s', err, self._up_path)
+                if f_size == 0:
                     corrupted_files += 1
-                    if self._is_cancelled:
-                        return
+                    LOGGER.error('%s size is zero, telegram don\'t upload zero size files', self._up_path)
                     continue
-                finally:
-                    if not self._is_cancelled and await aiopath.exists(self._up_path) and (not self._listener.seed or self._listener.newDir or
-                        dirpath.endswith('/splited_files_mltb') or '/copied_mltb/' in self._up_path):
-                        await clean_target(self._up_path)
+                if self._is_cancelled:
+                    return
+                caption = await self._prepare_file(file_, dirpath)
+                if self._last_msg_in_group:
+                    group_lists = [x for v in self._media_dict.values() for x in v.keys()]
+                    match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path)
+                    if not match or match and match.group(0) not in group_lists:
+                        for key, value in list(self._media_dict.items()):
+                            for subkey, msgs in list(value.items()):
+                                if len(msgs) > 1:
+                                    await self._send_media_group(msgs, subkey, key)
+                self._last_msg_in_group = False
+                self._last_uploaded = 0
+                await self._upload_file(caption, file_)
+                total_files += 1
+                if self._is_cancelled:
+                    return
+                if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
+                    self._msgs_dict[self _
+
+_send_msg.link] = file_
+                await sleep(3)
+            except Exception as err:
+                if isinstance(err, RetryError):
+                    LOGGER.info('Total Attempts: %s', err.last_attempt.attempt_number, exc_info=True)
+                    corrupted_files += 1
+                    self._is_corrupted = True
+                    err = err.last_attempt.exception()
+                LOGGER.error('%s. Path: %s', err, self._up_path)
+                corrupted_files += 1
+                if self._is_cancelled:
+                    return
+                continue
+            finally:
+                if not self._is_cancelled and await aiopath.exists(self._up_path) and (not self._listener.seed or self._listener.newDir or
+                    dirpath.endswith('/splited_files_mltb') or '/copied_mltb/' in self._up_path):
+                    await clean_target(self._up_path)
 
         for key, value in list(self._media_dict.items()):
             for subkey, msgs in list(value.items()):
@@ -182,7 +193,7 @@ class TgUploader:
                         self._up_path = new_path
                 if self._is_cancelled:
                     return
-                self._send_msg = await selfN._client.send_video(chat_id=self._send_msg.chat.id,
+                self._send_msg = await self._client.send_video(chat_id=self._send_msg.chat.id,
                                                                video=self._up_path,
                                                                caption=caption,
                                                                duration=duration,

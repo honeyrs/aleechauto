@@ -197,7 +197,7 @@ class VidEcxecutor(FFProgress):
                     self._up_path = ospath.join(*all_files[0])
             self._files.clear()
             LOGGER.info(f"Final path set: {self._up_path} for MID: {self.listener.mid}")
-            self.listener.name = ospath.basename(self._up_path)  # Update listener.name
+            self.listener.name = ospath.basename(self._up_path)
             return self._up_path
         except Exception as e:
             LOGGER.error(f"Final path error: {e}")

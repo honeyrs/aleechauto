@@ -180,38 +180,32 @@ class TaskListener(TaskConfig):
             split_size = TELEGRAM_LIMIT - 20 * 1024 * 1024  # 2,076,180,480 bytes
             output_dir = ospath.dirname(file_path)
 
-            temp_dir = ospath.join(output_dir, "split_temp")
-            await makedirs(temp_dir, exist_ok=True)
-            chunk_prefix = ospath.join(temp_dir, f"{base_name}_chunk")
-            cmd_split = ['split', '-b', str(split_size), file_path, chunk_prefix]
-            _, stderr, rcode = await cmd_exec(cmd_split)
+            # Use FFmpeg to split into parts
+            output_pattern = ospath.join(output_dir, f"{base_name}_part%03d.mkv")
+            cmd_ffmpeg = [
+                'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
+                '-f', 'segment', '-segment_size', str(split_size),
+                '-reset_timestamps', '1', output_pattern, '-y'
+            ]
+            _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
             if rcode != 0:
-                LOGGER.error(f"Unix split failed for {file_path}: {stderr}")
-                await clean_target(temp_dir)
+                LOGGER.error(f"FFmpeg split failed for {file_path}: {stderr}")
                 return [], []
 
+            # Collect split files
             o_files, m_size = [], []
-            chunk_files = [ospath.join(temp_dir, f) for f in await listdir(temp_dir) if f.startswith(f"{base_name}_chunk")]
-            for i, chunk in enumerate(chunk_files):
-                output_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
-                cmd_ffmpeg = [
-                    'ffmpeg', '-i', chunk, '-c', 'copy', '-map', '0',
-                    '-f', 'matroska', output_file, '-y'
-                ]
-                _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-                if rcode == 0:
-                    part_size = await get_path_size(output_file)
-                    if part_size <= TELEGRAM_LIMIT:
-                        o_files.append(output_file)
-                        m_size.append(part_size)
-                    else:
-                        LOGGER.warning(f"Part {output_file} exceeds {TELEGRAM_LIMIT} bytes, removing")
-                        await clean_target(output_file)
+            for i in range(1000):  # Reasonable upper limit for parts
+                part_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
+                if not await aiopath.exists(part_file):
+                    break
+                part_size = await get_path_size(part_file)
+                if part_size <= TELEGRAM_LIMIT:
+                    o_files.append(part_file)
+                    m_size.append(part_size)
                 else:
-                    LOGGER.error(f"FFmpeg fix failed for chunk {chunk}: {stderr}")
-                    await clean_target(output_file)
+                    LOGGER.warning(f"Part {part_file} exceeds {TELEGRAM_LIMIT} bytes, removing")
+                    await clean_target(part_file)
 
-            await clean_target(temp_dir)
             if not o_files:
                 LOGGER.error(f"No valid split files generated for {file_path}")
                 return [], []
@@ -220,7 +214,6 @@ class TaskListener(TaskConfig):
             return o_files, m_size
         except Exception as e:
             LOGGER.error(f"Split file error for {file_path}: {e}", exc_info=True)
-            await clean_target(temp_dir) if 'temp_dir' in locals() else None
             return [], []
 
     async def onUploadComplete(self, link, size, files, folders, mime_type):

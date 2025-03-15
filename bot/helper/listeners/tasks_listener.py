@@ -147,7 +147,7 @@ class TaskListener(TaskConfig):
         # Splitting logic for large files
         o_files, m_size = [], []
         TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB in bytes
-        DEFAULT_SPLIT_SIZE = 2092147200  # 2 GB - 5 MB
+        DEFAULT_SPLIT_SIZE = 2092147200  # 2 GB - 5 MB teste 
         split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
         if is_premium_user(self.user_id) and 'PREMIUM_SPLIT_SIZE' in config_dict:
             split_size = config_dict['PREMIUM_SPLIT_SIZE']  # e.g., 4 GB for premium

@@ -146,12 +146,12 @@ class TaskListener(TaskConfig):
 
         # Splitting logic for large files
         o_files, m_size = [], []
-        TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB in bytes (2,147,483,648)
-        DEFAULT_SPLIT_SIZE = 2097152000  # 2 GB exact, per LEECH_SPLIT_SIZE
+        TELEGRAM_LIMIT = 2147483648  # 2 GB exact (2,147,483,648 bytes)
+        DEFAULT_SPLIT_SIZE = 2097152000  # Your specified 2 GB
         split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
         if is_premium_user(self.user_id) and 'PREMIUM_SPLIT_SIZE' in config_dict:
-            split_size = config_dict['PREMIUM_SPLIT_SIZE']  # e.g., 4 GB for premium
-        split_size = min(split_size, TELEGRAM_LIMIT)  # Cap at Telegram's 2 GB limit
+            split_size = config_dict['PREMIUM_SPLIT_SIZE']
+        split_size = min(split_size, TELEGRAM_LIMIT - 10 * 1024 * 1024)  # 10 MB buffer for headers
 
         if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
             LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts of {split_size} bytes")
@@ -194,13 +194,13 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path, up_dir, split_size):
         try:
-            TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB (2,147,483,648 bytes)
+            TELEGRAM_LIMIT = 2147483648  # 2 GB exact
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
                 return [ospath.basename(file_path)], [file_size]
 
             base_name = ospath.splitext(ospath.basename(file_path))[0]
-            split_size = min(split_size, TELEGRAM_LIMIT - 1024 * 1024)  # 1 MB buffer
+            split_size = min(split_size, TELEGRAM_LIMIT - 10 * 1024 * 1024)  # 10 MB buffer
 
             # Step 1: Split file into raw chunks using Unix split
             temp_dir = ospath.join(up_dir, "split_temp")

@@ -146,23 +146,24 @@ class TaskListener(TaskConfig):
 
         # Splitting logic for large files
         o_files, m_size = [], []
-        TELEGRAM_LIMIT = 2147483648  # 2 GB exact (2,147,483,648 bytes)
+        TELEGRAM_LIMIT = 2147483648  # 2 GiB exact (2,147,483,648 bytes)
+        PYROGRAM_LIMIT = 2097152000  # 2,000 MiB as per Pyrogram/Telegram
         DEFAULT_SPLIT_SIZE = 2097152000  # Your specified 2 GB
         split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
         if is_premium_user(self.user_id) and 'PREMIUM_SPLIT_SIZE' in config_dict:
             split_size = config_dict['PREMIUM_SPLIT_SIZE']
-        split_size = min(split_size, TELEGRAM_LIMIT - 20 * 1024 * 1024)  # 20 MB buffer
+        split_size = min(split_size, PYROGRAM_LIMIT - 20 * 1024 * 1024)  # 20 MB buffer under 2,000 MiB
 
-        if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
+        if size > PYROGRAM_LIMIT and await aiopath.isfile(up_path):
             LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts of {split_size} bytes")
             o_files, m_size = await self._split_file(up_path, up_dir, split_size)
             if not o_files:
                 await self.onUploadError(f"Failed to split {self.name} into parts.")
                 return
             for f_size in m_size:
-                if f_size > TELEGRAM_LIMIT:
-                    LOGGER.error(f"Split file size {f_size} exceeds Telegram limit of {TELEGRAM_LIMIT} bytes")
-                    await self.onUploadError("Split file exceeds Telegram 2 GB limit.")
+                if f_size > PYROGRAM_LIMIT:
+                    LOGGER.error(f"Split file size {f_size} exceeds Pyrogram limit of {PYROGRAM_LIMIT} bytes")
+                    await self.onUploadError("Split file exceeds Pyrogram 2,000 MiB limit.")
                     return
         else:
             o_files.append(self.name)
@@ -194,13 +195,13 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path, up_dir, split_size):
         try:
-            TELEGRAM_LIMIT = 2147483648  # 2 GB exact
+            PYROGRAM_LIMIT = 2097152000  # 2,000 MiB
             file_size = await get_path_size(file_path)
-            if file_size <= TELEGRAM_LIMIT:
+            if file_size <= PYROGRAM_LIMIT:
                 return [ospath.basename(file_path)], [file_size]
 
             base_name = ospath.splitext(ospath.basename(file_path))[0]
-            split_size = min(split_size, TELEGRAM_LIMIT - 20 * 1024 * 1024)  # 20 MB buffer
+            split_size = min(split_size, PYROGRAM_LIMIT - 20 * 1024 * 1024)  # 20 MB buffer
 
             # Step 1: Split file into raw chunks using Unix split
             temp_dir = ospath.join(up_dir, "split_temp")
@@ -225,11 +226,11 @@ class TaskListener(TaskConfig):
                 _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
                 if rcode == 0:
                     part_size = await get_path_size(output_file)
-                    if part_size <= TELEGRAM_LIMIT:
+                    if part_size <= PYROGRAM_LIMIT:
                         o_files.append(ospath.basename(output_file))
                         m_size.append(part_size)
                     else:
-                        LOGGER.warning(f"Part {output_file} exceeds {TELEGRAM_LIMIT} bytes, removing")
+                        LOGGER.warning(f"Part {output_file} exceeds {PYROGRAM_LIMIT} bytes, removing")
                         await clean_target(output_file)
                 else:
                     LOGGER.error(f"FFmpeg fix failed for chunk {chunk}: {stderr}")

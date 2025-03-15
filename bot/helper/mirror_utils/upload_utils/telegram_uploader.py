@@ -53,26 +53,26 @@ class TgUploader:
         await self._user_settings()
         await self._msg_to_reply()
         corrupted_files = total_files = 0
-        TELEGRAM_LIMIT = 2147483648  # 2 GB exact
+        PYROGRAM_LIMIT = 2097152000  # 2,000 MiB
 
         for i, file_ in enumerate(o_files):
-            self._up_path = ospath.join(self._path, file_)
+            up_path = ospath.join(self._path, file_)  # Use local variable to avoid overwriting
             try:
                 f_size = m_size[i]
-                if f_size > TELEGRAM_LIMIT:
-                    LOGGER.error(f"File {self._up_path} size {f_size} exceeds Telegram limit {TELEGRAM_LIMIT}")
+                if f_size > PYROGRAM_LIMIT:
+                    LOGGER.error(f"File {up_path} size {f_size} exceeds Pyrogram limit {PYROGRAM_LIMIT}")
                     corrupted_files += 1
                     continue
                 if f_size == 0:
                     corrupted_files += 1
-                    LOGGER.error(f"{self._up_path} size is zero, Telegram doesn't upload zero-size files")
+                    LOGGER.error(f"{up_path} size is zero, Telegram doesn't upload zero-size files")
                     continue
                 if self._is_cancelled:
                     return
                 caption = await self._prepare_file(file_, self._path)
                 if self._last_msg_in_group:
                     group_lists = [x for v in self._media_dict.values() for x in v.keys()]
-                    match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', file_)  # Match on filename, not full path
+                    match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', file_)
                     if not match or match and match.group(0) not in group_lists:
                         for key, value in list(self._media_dict.items()):
                             for subkey, msgs in list(value.items()):
@@ -80,7 +80,7 @@ class TgUploader:
                                     await self._send_media_group(msgs, subkey, key)
                 self._last_msg_in_group = False
                 self._last_uploaded = 0
-                await self._upload_file(caption, self._up_path)  # Pass full path to _upload_file
+                await self._upload_file(caption, up_path)  # Pass full path directly
                 total_files += 1
                 if self._is_cancelled:
                     return
@@ -93,17 +93,17 @@ class TgUploader:
                     corrupted_files += 1
                     self._is_corrupted = True
                     err = err.last_attempt.exception()
-                LOGGER.error(f'{err}. Path: {self._up_path}')
+                LOGGER.error(f'{err}. Path: {up_path}')
                 corrupted_files += 1
                 if self._is_cancelled:
                     return
                 continue
             finally:
-                if not self._is_cancelled and await aiopath.exists(self._up_path) and (
+                if not self._is_cancelled and await aiopath.exists(up_path) and (
                     not self._listener.seed or self._listener.newDir or
-                    self._path.endswith('/splited_files_mltb') or '/copied_mltb/' in self._up_path
+                    self._path.endswith('/splited_files_mltb') or '/copied_mltb/' in up_path
                 ):
-                    await clean_target(self._up_path)
+                    await clean_target(up_path)
 
         for key, value in list(self._media_dict.items()):
             for subkey, msgs in list(value.items()):
@@ -294,6 +294,7 @@ class TgUploader:
 
     async def _prepare_file(self, file_, dirpath):
         caption = self._caption_mode(file_)
+        up_path = ospath.join(dirpath, file_)
         if len(file_) > 60:
             if is_archive(file_):
                 name = get_base_name(file_)
@@ -311,10 +312,10 @@ class TgUploader:
                 dirpath = ospath.join(dirpath, 'copied_mltb')
                 await makedirs(dirpath, exist_ok=True)
                 new_path = ospath.join(dirpath, f'{name}{ext}')
-                await copy(self._up_path, new_path)
+                await copy(up_path, new_path)
             else:
-                await aiorename(self._up_path, new_path)
-            self._up_path = new_path
+                await aiorename(up_path, new_path)
+            up_path = new_path
         return caption
 
     def _caption_mode(self, file):

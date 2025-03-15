@@ -65,7 +65,7 @@ class TgUploader:
                 total_files += 1
                 if self._is_cancelled:
                     return
-                if not self._is_corrupted and (self Debugging_Listener.isSuperChat or self._leech_log):
+                if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
                     self._msgs_dict[self._send_msg.link] = ospath.basename(file_path)
                 await sleep(3)
             except Exception as err:

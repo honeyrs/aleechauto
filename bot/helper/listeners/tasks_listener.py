@@ -31,7 +31,6 @@ class TaskListener(TaskConfig):
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
 
     async def onDownloadComplete(self):
-        # Import TgUploader here to avoid circular import
         from bot.helper.mirror_utils.upload_utils.telegram_uploader import TgUploader
 
         multi_links = False
@@ -123,7 +122,6 @@ class TaskListener(TaskConfig):
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
 
-        # Splitting logic
         o_files, m_size = [], []
         TELEGRAM_LIMIT = 2097152000  # 2,000 MiB
         SPLIT_SIZE = TELEGRAM_LIMIT - 20 * 1024 * 1024  # 2,076,180,480 bytes

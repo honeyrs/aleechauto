@@ -151,7 +151,7 @@ class TaskListener(TaskConfig):
         split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
         if is_premium_user(self.user_id) and 'PREMIUM_SPLIT_SIZE' in config_dict:
             split_size = config_dict['PREMIUM_SPLIT_SIZE']
-        split_size = min(split_size, TELEGRAM_LIMIT - 10 * 1024 * 1024)  # 10 MB buffer for headers
+        split_size = min(split_size, TELEGRAM_LIMIT - 20 * 1024 * 1024)  # 20 MB buffer
 
         if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
             LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts of {split_size} bytes")
@@ -200,7 +200,7 @@ class TaskListener(TaskConfig):
                 return [ospath.basename(file_path)], [file_size]
 
             base_name = ospath.splitext(ospath.basename(file_path))[0]
-            split_size = min(split_size, TELEGRAM_LIMIT - 10 * 1024 * 1024)  # 10 MB buffer
+            split_size = min(split_size, TELEGRAM_LIMIT - 20 * 1024 * 1024)  # 20 MB buffer
 
             # Step 1: Split file into raw chunks using Unix split
             temp_dir = ospath.join(up_dir, "split_temp")

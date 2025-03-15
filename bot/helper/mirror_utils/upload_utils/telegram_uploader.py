@@ -40,7 +40,6 @@ class TgUploader:
         self._last_msg_in_group = False
         self._client = None
         self._send_msg = None
-        self._up_path = ''
         self._leech_log = config_dict['LEECH_LOG']
 
     async def _upload_progress(self, current, _):
@@ -73,7 +72,7 @@ class TgUploader:
                 caption = await self._prepare_file(file_, self._path)
                 if self._last_msg_in_group:
                     group_lists = [x for v in self._media_dict.values() for x in v.keys()]
-                    match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path)
+                    match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', file_)  # Match on filename, not full path
                     if not match or match and match.group(0) not in group_lists:
                         for key, value in list(self._media_dict.items()):
                             for subkey, msgs in list(value.items()):
@@ -81,7 +80,7 @@ class TgUploader:
                                     await self._send_media_group(msgs, subkey, key)
                 self._last_msg_in_group = False
                 self._last_uploaded = 0
-                await self._upload_file(caption, file_)
+                await self._upload_file(caption, self._up_path)  # Pass full path to _upload_file
                 total_files += 1
                 if self._is_cancelled:
                     return
@@ -124,7 +123,7 @@ class TgUploader:
         await self._listener.onUploadComplete(None, self._size, self._msgs_dict, total_files, corrupted_files)
 
     @retry(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(4), retry=retry_if_exception_type(Exception))
-    async def _upload_file(self, caption, file, force_document=False):
+    async def _upload_file(self, caption, up_path, force_document=False):
         if self._thumb and not await aiopath.exists(self._thumb):
             self._thumb = None
         thumb, ss_image = self._thumb, None
@@ -132,23 +131,23 @@ class TgUploader:
             return
         try:
             async with bot_lock:
-                self._client = (bot_dict['USERBOT'] if bot_dict['IS_PREMIUM'] and await get_path_size(self._up_path) > DEFAULT_SPLIT_SIZE
+                self._client = (bot_dict['USERBOT'] if bot_dict['IS_PREMIUM'] and await get_path_size(up_path) > DEFAULT_SPLIT_SIZE
                                 or bot_dict['USERBOT'] and config_dict['USERBOT_LEECH'] else bot)
-            is_video, is_audio, is_image = await get_document_type(self._up_path)
+            is_video, is_audio, is_image = await get_document_type(up_path)
             if not is_image and thumb is None:
-                file_name = ospath.splitext(file)[0]
+                file_name = ospath.splitext(ospath.basename(up_path))[0]
                 thumb_path = ospath.join(self._path, 'yt-dlp-thumb', f'{file_name}.jpg')
                 if await aiopath.isfile(thumb_path):
                     thumb = thumb_path
                 elif is_audio and not is_video:
-                    thumb = await get_audio_thumb(self._up_path)
+                    thumb = await get_audio_thumb(up_path)
             if is_video:
-                duration = (await get_media_info(self._up_path))[0]
-                ss_image = await self._gen_ss(self._up_path)
+                duration = (await get_media_info(up_path))[0]
+                ss_image = await self._gen_ss(up_path)
                 if self._listener.screenShots:
                     await self._send_screenshots()
                 if not thumb:
-                    thumb = await create_thumbnail(self._up_path, duration)
+                    thumb = await create_thumbnail(up_path, duration)
 
             if self._listener.as_doc or force_document or (not is_video and not is_audio and not is_image):
                 key = 'documents'
@@ -156,7 +155,7 @@ class TgUploader:
                     return
                 self._send_msg = await self._client.send_document(
                     chat_id=self._send_msg.chat.id,
-                    document=self._up_path,
+                    document=up_path,
                     thumb=thumb,
                     caption=caption,
                     disable_notification=True,
@@ -170,22 +169,23 @@ class TgUploader:
                         width, height = img.size
                 else:
                     width, height = 480, 320
-                if not self._up_path.upper().endswith(('.MKV', '.MP4')):
-                    dirpath, file_ = ospath.split(self._up_path)
+                if not up_path.upper().endswith(('.MKV', '.MP4')):
+                    dirpath, file_ = ospath.split(up_path)
                     if self._listener.seed and not self._listener.newDir and not dirpath.endswith('/splited_files_mltb'):
                         dirpath = ospath.join(dirpath, 'copied_mltb')
                         await makedirs(dirpath, exist_ok=True)
                         new_path = ospath.join(dirpath, f'{ospath.splitext(file_)[0]}.mp4')
-                        self._up_path = await copy(self._up_path, new_path)
+                        await copy(up_path, new_path)
+                        up_path = new_path
                     else:
-                        new_path = f'{ospath.splitext(self._up_path)[0]}.mp4'
-                        await aiorename(self._up_path, new_path)
-                        self._up_path = new_path
+                        new_path = f'{ospath.splitext(up_path)[0]}.mp4'
+                        await aiorename(up_path, new_path)
+                        up_path = new_path
                 if self._is_cancelled:
                     return
                 self._send_msg = await self._client.send_video(
                     chat_id=self._send_msg.chat.id,
-                    video=self._up_path,
+                    video=up_path,
                     caption=caption,
                     duration=duration,
                     width=width,
@@ -198,12 +198,12 @@ class TgUploader:
                 )
             elif is_audio:
                 key = 'audios'
-                duration, artist, title = await get_media_info(self._up_path)
+                duration, artist, title = await get_media_info(up_path)
                 if self._is_cancelled:
                     return
                 self._send_msg = await self._client.send_audio(
                     chat_id=self._send_msg.chat.id,
-                    audio=self._up_path,
+                    audio=up_path,
                     caption=caption,
                     duration=duration,
                     performer=artist,
@@ -219,7 +219,7 @@ class TgUploader:
                     return
                 self._send_msg = await bot.send_photo(
                     chat_id=self._send_msg.chat.id,
-                    photo=self._up_path,
+                    photo=up_path,
                     caption=caption,
                     disable_notification=True,
                     progress=self._upload_progress,
@@ -234,7 +234,7 @@ class TgUploader:
                 await self._copy_Leech(self._listener.upDest, self._send_msg)
 
             if not self._is_cancelled and self._media_group and (self._send_msg.video or self._send_msg.document):
-                if match := re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path):
+                if match := re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', ospath.basename(up_path)):
                     subkey = match.group(0)
                     if subkey in self._media_dict[key].keys():
                         self._media_dict[key][subkey].append(self._send_msg)
@@ -255,10 +255,10 @@ class TgUploader:
             if not self._thumb and thumb:
                 await clean_target(thumb)
             err_type = 'RPCError: ' if isinstance(err, RPCError) else ''
-            LOGGER.error(f'{err_type}{err}. Path: {self._up_path}')
+            LOGGER.error(f'{err_type}{err}. Path: {up_path}')
             if 'Telegram says: [400' in str(err) and key != 'documents':
-                LOGGER.error(f'Retrying As Document. Path: {self._up_path}', exc_info=True)
-                return await self._upload_file(caption, file, True)
+                LOGGER.error(f'Retrying As Document. Path: {up_path}', exc_info=True)
+                return await self._upload_file(caption, up_path, True)
             raise err
 
     async def _user_settings(self):
@@ -272,8 +272,8 @@ class TgUploader:
         if config_dict['AUTO_THUMBNAIL']:
             for dirpath, _, files in await sync_to_async(walk, self._path):
                 for file in files:
-                    if file.startswith('Thumb') and (await get_document_type(filepath))[-1]:
-                        self._thumb = filepath
+                    if file.startswith('Thumb') and (await get_document_type(ospath.join(dirpath, file)))[-1]:
+                        self._thumb = ospath.join(dirpath, file)
                         break
 
     @property
@@ -306,15 +306,15 @@ class TgUploader:
             else:
                 name, ext = file_, ''
             name = name[:60 - len(ext)]
+            new_path = ospath.join(dirpath, f'{name}{ext}')
             if self._listener.seed and not self._listener.newDir and not dirpath.endswith('/splited_files_mltb'):
                 dirpath = ospath.join(dirpath, 'copied_mltb')
                 await makedirs(dirpath, exist_ok=True)
                 new_path = ospath.join(dirpath, f'{name}{ext}')
-                self._up_path = await copy(self._up_path, new_path)
+                await copy(self._up_path, new_path)
             else:
-                new_path = ospath.join(dirpath, f'{name}{ext}')
                 await aiorename(self._up_path, new_path)
-                self._up_path = new_path
+            self._up_path = new_path
         return caption
 
     def _caption_mode(self, file):

@@ -194,36 +194,48 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path, up_dir, split_size):
         try:
-            TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB
+            TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB (2,147,483,648 bytes)
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
                 return [ospath.basename(file_path)], [file_size]
 
             base_name = ospath.splitext(ospath.basename(file_path))[0]
-            output_pattern = ospath.join(up_dir, f"{base_name}_part%03d.mkv")
-            cmd = [
-                'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
-                '-f', 'segment', '-segment_format', 'matroska',
-                '-segment_size', str(split_size),
-                output_pattern, '-y'
-            ]
-            stdout, stderr, rcode = await cmd_exec(cmd)
+            split_size = min(split_size, TELEGRAM_LIMIT - 1024 * 1024)  # 1 MB buffer
+
+            # Step 1: Split file into raw chunks using Unix split
+            temp_dir = ospath.join(up_dir, "split_temp")
+            await makedirs(temp_dir, exist_ok=True)
+            chunk_prefix = ospath.join(temp_dir, f"{base_name}_chunk")
+            cmd_split = ['split', '-b', str(split_size), file_path, chunk_prefix]
+            _, stderr, rcode = await cmd_exec(cmd_split)
             if rcode != 0:
-                LOGGER.error(f"FFmpeg split failed for {file_path}: {stderr}")
+                LOGGER.error(f"Unix split failed for {file_path}: {stderr}")
+                await clean_target(temp_dir)
                 return [], []
 
+            # Step 2: Fix each chunk with FFmpeg to make valid MKV files
             o_files, m_size = [], []
-            async for f in listdir(up_dir):
-                if f.startswith(f"{base_name}_part") and f.endswith('.mkv'):
-                    part_path = ospath.join(up_dir, f)
-                    part_size = await get_path_size(part_path)
+            chunk_files = [ospath.join(temp_dir, f) for f in await listdir(temp_dir) if f.startswith(f"{base_name}_chunk")]
+            for i, chunk in enumerate(chunk_files):
+                output_file = ospath.join(up_dir, f"{base_name}_part{i:03d}.mkv")
+                cmd_ffmpeg = [
+                    'ffmpeg', '-i', chunk, '-c', 'copy', '-map', '0',
+                    '-f', 'matroska', output_file, '-y'
+                ]
+                _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
+                if rcode == 0:
+                    part_size = await get_path_size(output_file)
                     if part_size <= TELEGRAM_LIMIT:
-                        o_files.append(f)
+                        o_files.append(ospath.basename(output_file))
                         m_size.append(part_size)
                     else:
-                        LOGGER.warning(f"Part {f} exceeds {TELEGRAM_LIMIT} bytes, removing")
-                        await clean_target(part_path)
+                        LOGGER.warning(f"Part {output_file} exceeds {TELEGRAM_LIMIT} bytes, removing")
+                        await clean_target(output_file)
+                else:
+                    LOGGER.error(f"FFmpeg fix failed for chunk {chunk}: {stderr}")
+                    await clean_target(output_file)
 
+            await clean_target(temp_dir)  # Clean up temporary chunks
             if not o_files:
                 LOGGER.error(f"No valid split files generated for {file_path}")
                 return [], []
@@ -232,6 +244,7 @@ class TaskListener(TaskConfig):
             return o_files, m_size
         except Exception as e:
             LOGGER.error(f"Split file error for {file_path}: {e}", exc_info=True)
+            await clean_target(temp_dir) if 'temp_dir' in locals() else None
             return [], []
 
     async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):

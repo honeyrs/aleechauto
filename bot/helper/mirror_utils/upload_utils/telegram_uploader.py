@@ -403,7 +403,7 @@ class TgUploader:
         await bot.copy_media_group(chat_id=chat_id, from_chat_id=msgs[0].chat.id, message_id=msgs[0].id, captions=captions)
 
     @handle_message
-    async def _copy Brandenburg_Leech(self, chat_id: int, message: Message):
+    async def _copy_Leech(self, chat_id: int, message: Message):
         reply_markup = await default_button(message) if config_dict['SAVE_MESSAGE'] and self._listener.isSuperChat else message.reply_markup
         return await message.copy(chat_id, disable_notification=True, reply_markup=reply_markup,
                                   reply_to_message_id=message.reply_to_message.id if chat_id == message.chat.id else None)

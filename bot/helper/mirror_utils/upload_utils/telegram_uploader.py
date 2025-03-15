@@ -23,7 +23,7 @@ class TgUploader:
         self._last_uploaded = 0
         self._processed_bytes = 0
         self._is_cancelled = False
-        self._thumb = self._listener.thumb
+        self._thumb = self._listener.thumb if self._listener.thumb and aiopath.exists(self._listener.thumb) else None
         self._msgs_dict = {}
         self._is_corrupted = False
         self._client = None
@@ -65,7 +65,7 @@ class TgUploader:
                 total_files += 1
                 if self._is_cancelled:
                     return
-                if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
+                if not self._is_corrupted and (self Debugging_Listener.isSuperChat or self._leech_log):
                     self._msgs_dict[self._send_msg.link] = ospath.basename(file_path)
                 await sleep(3)
             except Exception as err:
@@ -98,23 +98,28 @@ class TgUploader:
 
     @retry(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(4), retry=retry_if_exception_type(Exception))
     async def _upload_file(self, caption, up_path, force_document=False):
-        if self._thumb and not await aiopath.exists(self._thumb):
-            self._thumb = None
+        if not up_path or not await aiopath.exists(up_path):
+            raise FileNotFoundError(f"Upload path is invalid or missing: {up_path}")
+
         thumb = self._thumb
         if self._is_cancelled:
             return
+
         try:
             async with bot_lock:
                 self._client = bot
             is_video, is_audio, is_image = await get_document_type(up_path)
-            if is_video:
+            LOGGER.debug(f"File type for {up_path}: video={is_video}, audio={is_audio}, image={is_image}")
+
+            if is_video and not thumb:
                 duration = (await get_media_info(up_path))[0]
-                if not thumb:
-                    thumb = await create_thumbnail(up_path, duration)
+                thumb = await create_thumbnail(up_path, duration)
+                if not thumb or not await aiopath.exists(thumb):
+                    LOGGER.warning(f"Thumbnail creation failed or missing for {up_path}, proceeding without")
+                    thumb = None
 
             if self._listener.as_doc or force_document or (not is_video and not is_audio and not is_image):
-                if self._is_cancelled:
-                    return
+                LOGGER.debug(f"Uploading {up_path} as document")
                 self._send_msg = await self._client.send_document(
                     chat_id=self._send_msg.chat.id,
                     document=up_path,
@@ -125,11 +130,9 @@ class TgUploader:
                     reply_to_message_id=self._send_msg.id
                 )
             elif is_video:
-                if thumb:
-                    with Image.open(thumb) as img:
-                        width, height = img.size
-                else:
-                    width, height = 480, 320
+                LOGGER.debug(f"Uploading {up_path} as video")
+                duration = (await get_media_info(up_path))[0]
+                width, height = (await sync_to_async(lambda: Image.open(thumb).size) if thumb else (480, 320))
                 if not up_path.upper().endswith(('.MKV', '.MP4')):
                     dirpath, file_ = ospath.split(up_path)
                     new_path = ospath.join(dirpath, f'{ospath.splitext(file_)[0]}.mp4')
@@ -151,8 +154,7 @@ class TgUploader:
                     reply_to_message_id=self._send_msg.id
                 )
             else:
-                if self._is_cancelled:
-                    return
+                LOGGER.debug(f"Uploading {up_path} as default document")
                 self._send_msg = await self._client.send_document(
                     chat_id=self._send_msg.chat.id,
                     document=up_path,
@@ -162,20 +164,23 @@ class TgUploader:
                     progress=self._upload_progress,
                     reply_to_message_id=self._send_msg.id
                 )
-            if not self._thumb and thumb:
+
+            if thumb and thumb != self._thumb:
                 await clean_target(thumb)
+
         except FloodWait as f:
-            LOGGER.warning(f)
+            LOGGER.warning(f"Flood wait: {f.value} seconds")
             await sleep(f.value * 1.2)
+            raise
         except Exception as err:
-            if not self._thumb and thumb:
+            if thumb and thumb != self._thumb:
                 await clean_target(thumb)
             err_type = 'RPCError: ' if isinstance(err, RPCError) else ''
-            LOGGER.error(f'{err_type}{err}. Path: {up_path}')
+            LOGGER.error(f"{err_type}{err} - Upload failed for path: {up_path}", exc_info=True)
             if 'Telegram says: [400' in str(err) and not force_document:
-                LOGGER.error(f'Retrying As Document. Path: {up_path}')
+                LOGGER.info(f"Retrying {up_path} as document due to error: {err}")
                 return await self._upload_file(caption, up_path, True)
-            raise err
+            raise
 
     async def _msg_to_reply(self):
         self._send_msg = self._listener.message

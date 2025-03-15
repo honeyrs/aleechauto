@@ -53,14 +53,14 @@ class TgUploader:
         await self._user_settings()
         await self._msg_to_reply()
         corrupted_files = total_files = 0
-        PYROGRAM_LIMIT = 2097152000  # 2,000 MiB
+        TELEGRAM_LIMIT = 2097152000  # 2,000 MiB
 
         for i, file_ in enumerate(o_files):
-            up_path = ospath.join(self._path, file_)  # Use local variable to avoid overwriting
+            up_path = ospath.join(self._path, file_)
             try:
                 f_size = m_size[i]
-                if f_size > PYROGRAM_LIMIT:
-                    LOGGER.error(f"File {up_path} size {f_size} exceeds Pyrogram limit {PYROGRAM_LIMIT}")
+                if f_size > TELEGRAM_LIMIT:
+                    LOGGER.error(f"File {up_path} size {f_size} exceeds Telegram limit {TELEGRAM_LIMIT}")
                     corrupted_files += 1
                     continue
                 if f_size == 0:

@@ -22,9 +22,7 @@ from bot.helper.stream_utils.file_properties import gen_link
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import deleteMessage, handle_message
 
-
 LOGGER = getLogger(__name__)
-
 
 class TgUploader:
     def __init__(self, listener: task.TaskListener, path: str, size: int):
@@ -56,58 +54,57 @@ class TgUploader:
         await self._user_settings()
         await self._msg_to_reply()
         corrupted_files = total_files = 0
-        for dirpath, _, files in sorted(await sync_to_async(walk, self._path)):
-            if dirpath.endswith('/yt-dlp-thumb'):
-                continue
-            for file_ in natsorted(files):
-                self._up_path = ospath.join(dirpath, file_)
-                if file_.lower().endswith(tuple(self._listener.extensionFilter)) or file_.startswith('Thumb'):
-                    if not file_.startswith('Thumb'):
-                        await clean_target(self._up_path)
-                    continue
-                try:
-                    f_size = await get_path_size(self._up_path)
-                    if self._listener.seed and file_ in o_files and f_size in m_size:
-                        continue
-                    if f_size == 0:
-                        corrupted_files += 1
-                        LOGGER.error('%s size is zero, telegram don\'t upload zero size files', self._up_path)
-                        continue
-                    if self._is_cancelled:
-                        return
-                    caption = await self._prepare_file(file_, dirpath)
-                    if self._last_msg_in_group:
-                        group_lists = [x for v in self._media_dict.values() for x in v.keys()]
-                        match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path)
-                        if not match or match and match.group(0) not in group_lists:
-                            for key, value in list(self._media_dict.items()):
-                                for subkey, msgs in list(value.items()):
-                                    if len(msgs) > 1:
-                                        await self._send_media_group(msgs, subkey, key)
-                    self._last_msg_in_group = False
-                    self._last_uploaded = 0
-                    await self._upload_file(caption, file_)
-                    total_files += 1
-                    if self._is_cancelled:
-                        return
-                    if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
-                        self._msgs_dict[self._send_msg.link] = file_
-                    await sleep(3)
-                except Exception as err:
-                    if isinstance(err, RetryError):
-                        LOGGER.info('Total Attempts: %s', err.last_attempt.attempt_number, exc_info=True)
-                        corrupted_files += 1
-                        self._is_corrupted = True
-                        err = err.last_attempt.exception()
-                    LOGGER.error('%s. Path: %s', err, self._up_path)
+        TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB
+
+        for i, file_ in enumerate(o_files):
+            self._up_path = ospath.join(self._path, file_)
+            try:
+                f_size = m_size[i]
+                if f_size > TELEGRAM_LIMIT:
+                    LOGGER.error(f"File {self._up_path} size {f_size} exceeds Telegram limit {TELEGRAM_LIMIT}")
                     corrupted_files += 1
-                    if self._is_cancelled:
-                        return
                     continue
-                finally:
-                    if not self._is_cancelled and await aiopath.exists(self._up_path) and (not self._listener.seed or self._listener.newDir or
-                        dirpath.endswith('/splited_files_mltb') or '/copied_mltb/' in self._up_path):
-                        await clean_target(self._up_path)
+                if f_size == 0:
+                    corrupted_files += 1
+                    LOGGER.error(f"{self._up_path} size is zero, Telegram doesn't upload zero-size files")
+                    continue
+                if self._is_cancelled:
+                    return
+                caption = await self._prepare_file(file_, self._path)
+                if self._last_msg_in_group:
+                    group_lists = [x for v in self._media_dict.values() for x in v.keys()]
+                    match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path)
+                    if not match or match and match.group(0) not in group_lists:
+                        for key, value in list(self._media_dict.items()):
+                            for subkey, msgs in list(value.items()):
+                                if len(msgs) > 1:
+                                    await self._send_media_group(msgs, subkey, key)
+                self._last_msg_in_group = False
+                self._last_uploaded = 0
+                await self._upload_file(caption, file_)
+                total_files += 1
+                if self._is_cancelled:
+                    return
+                if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
+                    self._msgs_dict[self._send_msg.link] = file_
+                await sleep(3)
+            except Exception as err:
+                if isinstance(err, RetryError):
+                    LOGGER.info(f'Total Attempts: {err.last_attempt.attempt_number}', exc_info=True)
+                    corrupted_files += 1
+                    self._is_corrupted = True
+                    err = err.last_attempt.exception()
+                LOGGER.error(f'{err}. Path: {self._up_path}')
+                corrupted_files += 1
+                if self._is_cancelled:
+                    return
+                continue
+            finally:
+                if not self._is_cancelled and await aiopath.exists(self._up_path) and (
+                    not self._listener.seed or self._listener.newDir or
+                    self._path.endswith('/splited_files_mltb') or '/copied_mltb/' in self._up_path
+                ):
+                    await clean_target(self._up_path)
 
         for key, value in list(self._media_dict.items()):
             for subkey, msgs in list(value.items()):
@@ -123,7 +120,7 @@ class TgUploader:
         if total_files <= corrupted_files:
             await self._listener.onUploadError('Files Corrupted or unable to upload. Check logs!')
             return
-        LOGGER.info('Leech Completed: %s', self._listener.name)
+        LOGGER.info(f'Leech Completed: {self._listener.name}')
         await self._listener.onUploadComplete(None, self._size, self._msgs_dict, total_files, corrupted_files)
 
     @retry(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(4), retry=retry_if_exception_type(Exception))
@@ -157,13 +154,15 @@ class TgUploader:
                 key = 'documents'
                 if self._is_cancelled:
                     return
-                self._send_msg = await self._client.send_document(chat_id=self._send_msg.chat.id,
-                                                                  document=self._up_path,
-                                                                  thumb=thumb,
-                                                                  caption=caption,
-                                                                  disable_notification=True,
-                                                                  progress=self._upload_progress,
-                                                                  reply_to_message_id=self._send_msg.id)
+                self._send_msg = await self._client.send_document(
+                    chat_id=self._send_msg.chat.id,
+                    document=self._up_path,
+                    thumb=thumb,
+                    caption=caption,
+                    disable_notification=True,
+                    progress=self._upload_progress,
+                    reply_to_message_id=self._send_msg.id
+                )
             elif is_video:
                 key = 'videos'
                 if thumb:
@@ -184,42 +183,48 @@ class TgUploader:
                         self._up_path = new_path
                 if self._is_cancelled:
                     return
-                self._send_msg = await self._client.send_video(chat_id=self._send_msg.chat.id,
-                                                               video=self._up_path,
-                                                               caption=caption,
-                                                               duration=duration,
-                                                               width=width,
-                                                               height=height,
-                                                               thumb=thumb,
-                                                               supports_streaming=True,
-                                                               disable_notification=True,
-                                                               progress=self._upload_progress,
-                                                               reply_to_message_id=self._send_msg.id)
+                self._send_msg = await self._client.send_video(
+                    chat_id=self._send_msg.chat.id,
+                    video=self._up_path,
+                    caption=caption,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    thumb=thumb,
+                    supports_streaming=True,
+                    disable_notification=True,
+                    progress=self._upload_progress,
+                    reply_to_message_id=self._send_msg.id
+                )
             elif is_audio:
                 key = 'audios'
                 duration, artist, title = await get_media_info(self._up_path)
                 if self._is_cancelled:
                     return
-                self._send_msg = await self._client.send_audio(chat_id=self._send_msg.chat.id,
-                                                               audio=self._up_path,
-                                                               caption=caption,
-                                                               duration=duration,
-                                                               performer=artist,
-                                                               title=title,
-                                                               thumb=thumb,
-                                                               disable_notification=True,
-                                                               progress=self._upload_progress,
-                                                               reply_to_message_id=self._send_msg.id)
+                self._send_msg = await self._client.send_audio(
+                    chat_id=self._send_msg.chat.id,
+                    audio=self._up_path,
+                    caption=caption,
+                    duration=duration,
+                    performer=artist,
+                    title=title,
+                    thumb=thumb,
+                    disable_notification=True,
+                    progress=self._upload_progress,
+                    reply_to_message_id=self._send_msg.id
+                )
             else:
                 key = 'photos'
                 if self._is_cancelled:
                     return
-                self._send_msg = await bot.send_photo(chat_id=self._send_msg.chat.id,
-                                                      photo=self._up_path,
-                                                      caption=caption,
-                                                      disable_notification=True,
-                                                      progress=self._upload_progress,
-                                                      reply_to_message_id=self._send_msg.id)
+                self._send_msg = await bot.send_photo(
+                    chat_id=self._send_msg.chat.id,
+                    photo=self._up_path,
+                    caption=caption,
+                    disable_notification=True,
+                    progress=self._upload_progress,
+                    reply_to_message_id=self._send_msg.id
+                )
             if self._is_cancelled:
                 return
             await self._final_message(ss_image, bool(is_video or is_audio))
@@ -250,9 +255,9 @@ class TgUploader:
             if not self._thumb and thumb:
                 await clean_target(thumb)
             err_type = 'RPCError: ' if isinstance(err, RPCError) else ''
-            LOGGER.error('%s%s. Path: %s', err_type, err, self._up_path)
+            LOGGER.error(f'{err_type}{err}. Path: {self._up_path}')
             if 'Telegram says: [400' in str(err) and key != 'documents':
-                LOGGER.error('Retrying As Document. Path: %s', self._up_path, exc_info=True)
+                LOGGER.error(f'Retrying As Document. Path: {self._up_path}', exc_info=True)
                 return await self._upload_file(caption, file, True)
             raise err
 
@@ -285,10 +290,9 @@ class TgUploader:
 
     async def cancel_task(self):
         self._is_cancelled = True
-        LOGGER.info('Cancelling Upload: %s', self._listener.name)
+        LOGGER.info(f'Cancelling Upload: {self._listener.name}')
         await self._listener.onUploadError('Upload stopped by user!')
 
-    # ================================================== UTILS ==================================================
     async def _prepare_file(self, file_, dirpath):
         caption = self._caption_mode(file_)
         if len(file_) > 60:
@@ -325,7 +329,7 @@ class TgUploader:
             case 'mono':
                 caption = f'<code>{file}</code>'
         if self._user_caption:
-            caption = f'''{caption}\n\n{self._user_caption}''' if self._user_fnamecap else self._user_caption
+            caption = f'{caption}\n\n{self._user_caption}' if self._user_fnamecap else self._user_caption
         return caption
 
     async def _gen_ss(self, vid_path):
@@ -336,9 +340,7 @@ class TgUploader:
         if ss.error:
             return
         return ss.rimage
-    # ===========================================================================================================
 
-    # ================================================= MESSAGE =================================================
     @handle_message
     async def _msg_to_reply(self):
         if self._leech_log and self._leech_log != self._listener.message.chat.id:
@@ -360,7 +362,6 @@ class TgUploader:
     async def _send_media_group(self, msgs: list[Message], subkey: str, key: str):
         msgs_list = await msgs[0].reply_to_message.reply_media_group(media=self._get_input_media(subkey, key),
                                                                      quote=True, disable_notification=True)
-    #    if self._send_pm:
         await self._copy_media_group(self._listener.user_id, msgs_list)
         if self._listener.upDest:
             await self._copy_media_group(self._listener.upDest, msgs_list)
@@ -390,7 +391,6 @@ class TgUploader:
                     outputs.remove(m)
         if outputs:
             msgs_list = await self._send_msg.reply_media_group(media=inputs, quote=True, disable_notification=True)
-        #    if self._send_pm:
             await self._copy_media_group(self._listener.user_id, msgs_list)
             if self._listener.upDest:
                 await self._copy_media_group(self._listener.upDest, msgs_list)
@@ -403,7 +403,7 @@ class TgUploader:
         await bot.copy_media_group(chat_id=chat_id, from_chat_id=msgs[0].chat.id, message_id=msgs[0].id, captions=captions)
 
     @handle_message
-    async def _copy_Leech(self, chat_id: int, message: Message):
+    async def _copy Brandenburg_Leech(self, chat_id: int, message: Message):
         reply_markup = await default_button(message) if config_dict['SAVE_MESSAGE'] and self._listener.isSuperChat else message.reply_markup
         return await message.copy(chat_id, disable_notification=True, reply_markup=reply_markup,
                                   reply_to_message_id=message.reply_to_message.id if chat_id == message.chat.id else None)
@@ -434,4 +434,3 @@ class TgUploader:
                 input_media = InputMediaDocument(media=msg.document.file_id, caption=caption)
             imlist.append(input_media)
         return imlist
-    # ===========================================================================================================

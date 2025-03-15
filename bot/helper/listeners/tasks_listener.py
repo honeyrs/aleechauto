@@ -144,148 +144,76 @@ class TaskListener(TaskConfig):
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
 
-            # Splitting logic for large files
-            o_files, m_size = [], []
-            TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB in bytes
-            split_size = 4 * 1024 * 1024 * 1024 if is_premium_user(self.user_id) else TELEGRAM_LIMIT
-            if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
-                LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts of {split_size} bytes")
-                o_files, m_size = await self._split_file(up_path, up_dir, split_size)
-                if not o_files:
-                    await self.onUploadError(f"Failed to split {self.name} into parts.")
-                    return
-                # Verify each part is under 2GB
-                for f_size in m_size:
-                    if f_size > TELEGRAM_LIMIT:
-                        LOGGER.error(f"Split file size {f_size} exceeds Telegram limit of {TELEGRAM_LIMIT} bytes")
-                        await self.onUploadError(f"Split file exceeds Telegram 2GB limit.")
-                        return
-            else:
-                o_files.append(self.name)
-                m_size.append(size)
+        # Splitting logic for large files
+        o_files, m_size = [], []
+        TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB in bytes
+        DEFAULT_SPLIT_SIZE = 2092147200  # 2 GB - 5 MB
+        split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
+        if is_premium_user(self.user_id) and 'PREMIUM_SPLIT_SIZE' in config_dict:
+            split_size = config_dict['PREMIUM_SPLIT_SIZE']  # e.g., 4 GB for premium
+        split_size = min(split_size, TELEGRAM_LIMIT)  # Cap at 2 GB for Telegram
 
-            LOGGER.info(f"Leeching {self.name} (MID: {self.mid}) with o_files: {o_files}, m_size: {m_size}")
-            tg = TgUploader(self, up_dir, size)
-            async with task_dict_lock:
-                task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
-            try:
-                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
-                LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
-            except AsyncTimeoutError:
-                LOGGER.error(f"Upload timeout for MID: {self.mid}")
-                await self.onUploadError("Upload timed out after 10 minutes.")
+        if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
+            LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts of {split_size} bytes")
+            o_files, m_size = await self._split_file(up_path, up_dir, split_size)
+            if not o_files:
+                await self.onUploadError(f"Failed to split {self.name} into parts.")
                 return
-            except Exception as e:
-                LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
-                await self.onUploadError(f"Upload failed: {str(e)}")
-                return
-            await clean_download(self.dir)
-            async with task_dict_lock:
-                task_dict.pop(self.mid, None)
-            async with queue_dict_lock:
-                if self.mid in non_queued_up:
-                    non_queued_up.remove(self.mid)
-            await start_from_queued()
+            for f_size in m_size:
+                if f_size > TELEGRAM_LIMIT:
+                    LOGGER.error(f"Split file size {f_size} exceeds Telegram limit of {TELEGRAM_LIMIT} bytes")
+                    await self.onUploadError("Split file exceeds Telegram 2 GB limit.")
+                    return
+        else:
+            o_files.append(self.name)
+            m_size.append(size)
+
+        LOGGER.info(f"Leeching {self.name} (MID: {self.mid}) with o_files: {o_files}, m_size: {m_size}")
+        tg = TgUploader(self, up_dir, size)
+        async with task_dict_lock:
+            task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
+        try:
+            await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
+            LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
+        except AsyncTimeoutError:
+            LOGGER.error(f"Upload timeout for MID: {self.mid}")
+            await self.onUploadError("Upload timed out after 10 minutes.")
+            return
+        except Exception as e:
+            LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
+            await self.onUploadError(f"Upload failed: {str(e)}")
             return
 
-        if one_path := await self.isOneFile(up_path):
-            up_path = one_path
-
-        up_dir, self.name = ospath.split(up_path)
-        size = await get_path_size(up_dir)
-
-        if self.isLeech:
-            o_files, m_size = [], []
-            if not self.compress:
-                result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
-                if not result:
-                    return
-            LOGGER.info(f"Leeching with o_files: {o_files}, m_size: {m_size} for MID: {self.mid}")
-
-            add_to_queue, event = await check_running_tasks(self.mid, "up")
-            if add_to_queue:
-                LOGGER.info(f"Added to Queue/Upload: {self.name} (MID: {self.mid})")
-                async with task_dict_lock:
-                    task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
-                try:
-                    await wait_for(event.wait(), timeout=300)
-                except AsyncTimeoutError:
-                    LOGGER.error(f"Queue timeout for MID: {self.mid}")
-                    await self.onUploadError("Upload queue timeout.")
-                    return
-                async with task_dict_lock:
-                    if self.mid not in task_dict:
-                        return
-                LOGGER.info(f"Start from Queued/Upload: {self.name} (MID: {self.mid})")
-            async with queue_dict_lock:
-                non_queued_up.add(self.mid)
-
-            await start_from_queued()
-
-            size = await get_path_size(up_dir)
-            for s in m_size:
-                size -= s
-            LOGGER.info(f"Leech Name: {self.name} (MID: {self.mid})")
-            tg = TgUploader(self, up_dir, size)
-            async with task_dict_lock:
-                task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
-            try:
-                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
-                LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
-            except AsyncTimeoutError:
-                LOGGER.error(f"Upload timeout for MID: {self.mid}")
-                await self.onUploadError("Upload timed out after 10 minutes.")
-                return
-            except Exception as e:
-                LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
-                await self.onUploadError(f"Upload failed: {str(e)}")
-                return
-        elif not self.isLeech and self.isGofile:
-            LOGGER.info(f"GoFile Uploading: {self.name} (MID: {self.mid})")
-            go = GoFileUploader(self)
-            async with task_dict_lock:
-                task_dict[self.mid] = GofileUploadStatus(self, go, size, gid)
-            await gather(update_status_message(self.message.chat.id), go.goUpload())
-            if go.is_cancelled:
-                return
-        elif is_gdrive_id(self.upDest):
-            LOGGER.info(f"GDrive Uploading: {self.name} (MID: {self.mid})")
-            drive = gdUpload(self, up_path)
-            async with task_dict_lock:
-                task_dict[self.mid] = GdriveStatus(self, drive, size, gid, 'up')
-            await gather(update_status_message(self.message.chat.id), sync_to_async(drive.upload, size))
-        elif self.upDest and ':' in self.upDest:
-            LOGGER.info(f"RClone Uploading: {self.name} (MID: {self.mid})")
-            RCTransfer = RcloneTransferHelper(self)
-            async with task_dict_lock:
-                task_dict[self.mid] = RcloneStatus(self, RCTransfer, gid, 'up')
-            await gather(update_status_message(self.message.chat.id), RCTransfer.upload(up_path, size))
-        else:
-            LOGGER.warning(f"No valid upload destination for MID: {self.mid}, assuming upload complete")
-            await self.onUploadComplete(None, size, {}, 0, None)
+        await clean_download(self.dir)
+        async with task_dict_lock:
+            task_dict.pop(self.mid, None)
+        async with queue_dict_lock:
+            if self.mid in non_queued_up:
+                non_queued_up.remove(self.mid)
+        await start_from_queued()
 
     async def _split_file(self, file_path, up_dir, split_size):
         try:
-            TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB
+            TELEGRAM_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GB
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
                 return [ospath.basename(file_path)], [file_size]
 
-            base_name = ospath.splitext(self.name)[0]
-            output_pattern = ospath.join(up_dir, f"{base_name}_part%d.mkv")
+            base_name = ospath.splitext(ospath.basename(file_path))[0]
+            output_pattern = ospath.join(up_dir, f"{base_name}_part%03d.mkv")
             cmd = [
                 'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
                 '-f', 'segment', '-segment_format', 'matroska',
-                '-fs', str(min(split_size, TELEGRAM_LIMIT)),  # Ensure parts are ≤ 2GB
+                '-segment_size', str(split_size),
                 output_pattern, '-y'
             ]
-            _, stderr, rcode = await cmd_exec(cmd)
+            stdout, stderr, rcode = await cmd_exec(cmd)
             if rcode != 0:
-                LOGGER.error(f"FFmpeg split failed: {stderr}")
+                LOGGER.error(f"FFmpeg split failed for {file_path}: {stderr}")
                 return [], []
 
             o_files, m_size = [], []
-            for f in await listdir(up_dir):
+            async for f in listdir(up_dir):
                 if f.startswith(f"{base_name}_part") and f.endswith('.mkv'):
                     part_path = ospath.join(up_dir, f)
                     part_size = await get_path_size(part_path)
@@ -293,17 +221,17 @@ class TaskListener(TaskConfig):
                         o_files.append(f)
                         m_size.append(part_size)
                     else:
-                        LOGGER.warning(f"Part {f} exceeds {TELEGRAM_LIMIT} bytes, skipping")
+                        LOGGER.warning(f"Part {f} exceeds {TELEGRAM_LIMIT} bytes, removing")
                         await clean_target(part_path)
 
             if not o_files:
                 LOGGER.error(f"No valid split files generated for {file_path}")
                 return [], []
 
-            LOGGER.info(f"Split {file_path} into {o_files}")
+            LOGGER.info(f"Split {file_path} into {len(o_files)} parts: {o_files}")
             return o_files, m_size
         except Exception as e:
-            LOGGER.error(f"Split file error: {e}", exc_info=True)
+            LOGGER.error(f"Split file error for {file_path}: {e}", exc_info=True)
             return [], []
 
     async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):

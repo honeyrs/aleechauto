@@ -11,12 +11,11 @@ from bot import bot, bot_dict, bot_lock, config_dict, LOGGER
 from bot.helper.ext_utils.bot_utils import sync_to_async
 from bot.helper.ext_utils.files_utils import clean_target, get_path_size
 from bot.helper.ext_utils.media_utils import get_document_type, get_media_info, create_thumbnail
-from bot.helper.listeners import tasks_listener as task
 
 LOGGER = getLogger(__name__)
 
 class TgUploader:
-    def __init__(self, listener: task.TaskListener, path: str, size: int):
+    def __init__(self, listener, path: str, size: int):
         self._listener = listener
         self._path = path
         self._size = size
@@ -56,7 +55,6 @@ class TgUploader:
                     continue
                 if self._is_cancelled:
                     return
-                # Debug: Verify file exists
                 if not await aiopath.exists(file_path):
                     LOGGER.error(f"File not found for upload: {file_path}")
                     corrupted_files += 1

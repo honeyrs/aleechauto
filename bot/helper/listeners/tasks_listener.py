@@ -18,7 +18,6 @@ from bot.helper.ext_utils.status_utils import action, get_date_time, get_readabl
 from bot.helper.ext_utils.task_manager import start_from_queued
 from bot.helper.ext_utils.telegraph_helper import TelePost
 from bot.helper.mirror_utils.status_utils.telegram_status import TelegramStatus
-from bot.helper.mirror_utils.upload_utils.telegram_uploader import TgUploader
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import sendingMessage, update_status_message, copyMessage, auto_delete_message
 from bot.helper.video_utils.executor import VidEcxecutor
@@ -32,6 +31,9 @@ class TaskListener(TaskConfig):
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
 
     async def onDownloadComplete(self):
+        # Import TgUploader here to avoid circular import
+        from bot.helper.mirror_utils.upload_utils.telegram_uploader import TgUploader
+
         multi_links = False
         if self.sameDir and self.mid in self.sameDir['tasks']:
             while not (self.sameDir['total'] in [1, 0] or self.sameDir['total'] > 1 and len(self.sameDir['tasks']) > 1):
@@ -146,10 +148,10 @@ class TaskListener(TaskConfig):
         async with task_dict_lock:
             task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
         try:
-            # Debug: Check if files exist before upload
             for f in o_files:
                 if not await aiopath.exists(f):
                     LOGGER.error(f"File not found before upload: {f}")
+                    raise FileNotFoundError(f"Missing split file: {f}")
             await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
             LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
         except AsyncTimeoutError:
@@ -180,7 +182,6 @@ class TaskListener(TaskConfig):
             split_size = TELEGRAM_LIMIT - 20 * 1024 * 1024  # 2,076,180,480 bytes
             output_dir = ospath.dirname(file_path)
 
-            # Split file into raw chunks
             temp_dir = ospath.join(output_dir, "split_temp")
             await makedirs(temp_dir, exist_ok=True)
             chunk_prefix = ospath.join(temp_dir, f"{base_name}_chunk")
@@ -191,7 +192,6 @@ class TaskListener(TaskConfig):
                 await clean_target(temp_dir)
                 return [], []
 
-            # Fix chunks with FFmpeg
             o_files, m_size = [], []
             chunk_files = [ospath.join(temp_dir, f) for f in await listdir(temp_dir) if f.startswith(f"{base_name}_chunk")]
             for i, chunk in enumerate(chunk_files):
@@ -204,7 +204,7 @@ class TaskListener(TaskConfig):
                 if rcode == 0:
                     part_size = await get_path_size(output_file)
                     if part_size <= TELEGRAM_LIMIT:
-                        o_files.append(output_file)  # Full path
+                        o_files.append(output_file)
                         m_size.append(part_size)
                     else:
                         LOGGER.warning(f"Part {output_file} exceeds {TELEGRAM_LIMIT} bytes, removing")

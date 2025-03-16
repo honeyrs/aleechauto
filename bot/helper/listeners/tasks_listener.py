@@ -12,7 +12,7 @@ from bot.helper.ext_utils.links_utils import is_magnet, is_url, get_link
 from bot.helper.ext_utils.media_utils import get_document_type, get_media_info, create_thumbnail
 from bot.helper.mirror_utils.status_utils.telegram_status import TelegramStatus
 from bot.helper.telegram_helper.button_build import ButtonMaker
-from bot.helper.telegram_helper.message_utils import sendingMessage, copyMessage, auto_delete_message, update_status_message
+from bot.helper.telegram_helper.message_utils import sendingMessage, copyMessage, update_status_message
 from bot.helper.ext_utils.telegraph_helper import TelePost
 
 class TaskListener(TaskConfig):
@@ -194,7 +194,7 @@ class TgUploader:
         self._start_time = time()
         self._processed_bytes = 0
         self._is_cancelled = False
-        self._thumb = self._listener.thumb if self._listener.thumb and await aiopath.exists(self._listener.thumb) else None
+        self._thumb = listener.thumb  # No await here, defer validation to async method
         self._msgs_dict = {}
         self._client = None
         self._send_msg = None
@@ -225,7 +225,7 @@ class TgUploader:
                 await self._upload_file(caption, file_path)
                 uploaded_files += 1
                 self._msgs_dict[self._send_msg.link] = ospath.basename(file_path)
-                await sleep(3)  # Avoid rate limits
+                await sleep(3)
             except Exception as e:
                 LOGGER.error(f"Upload failed for {file_path}: {e}")
                 continue
@@ -251,10 +251,18 @@ class TgUploader:
         await self._listener.onUploadComplete(None, self._size, self._msgs_dict, total_files, total_files - uploaded_files)
 
     async def _upload_file(self, caption, up_path):
+        file_size = await get_path_size(up_path)
+        if file_size > 2097152000:
+            raise ValueError(f"File {up_path} size {file_size} exceeds Telegram 2 GB limit")
+
         if not await aiopath.exists(up_path):
             raise FileNotFoundError(f"Upload path missing: {up_path}")
 
         thumb = self._thumb
+        if thumb and not await aiopath.exists(thumb):  # Validate thumb asynchronously here
+            LOGGER.warning(f"Thumbnail {thumb} does not exist, using None")
+            thumb = None
+
         async with bot_lock:
             self._client = bot
 
@@ -303,6 +311,7 @@ class TgUploader:
                 progress=self._upload_progress,
                 reply_to_message_id=self._send_msg.id
             )
+        LOGGER.info(f"Uploaded {up_path} successfully")
 
     async def _msg_to_reply(self):
         self._send_msg = self._listener.message

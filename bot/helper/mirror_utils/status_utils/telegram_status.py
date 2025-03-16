@@ -20,7 +20,7 @@ class TelegramStatus:
         return get_readable_time(time() - self._elapsed)
 
     def processed_bytes(self):
-        return get_readable_file_size(self._obj.processed_bytes)
+        return get_readable_file_size(self._obj._processed_bytes)  # Use _processed_bytes from TgUploader
 
     def size(self):
         return get_readable_file_size(self._size)
@@ -33,17 +33,29 @@ class TelegramStatus:
 
     def progress(self):
         try:
-            progress_raw = self._obj.processed_bytes / self._size * 100
+            progress_raw = self._obj._processed_bytes / self._size * 100
         except:
             progress_raw = 0
         return f'{round(progress_raw, 2)}%'
 
     def speed(self):
-        return f'{get_readable_file_size(self._obj.speed)}/s'
+        try:
+            elapsed = time() - self._obj._start_time
+            if elapsed > 0:
+                return f'{get_readable_file_size(self._obj._processed_bytes / elapsed)}/s'
+            return '0 B/s'
+        except:
+            return '0 B/s'
 
     def eta(self):
         try:
-            return get_readable_time((self._size - self._obj.processed_bytes) / self._obj.speed)
+            elapsed = time() - self._obj._start_time
+            if elapsed > 0:
+                speed = self._obj._processed_bytes / elapsed
+                remaining_bytes = self._size - self._obj._processed_bytes
+                if speed > 0:
+                    return get_readable_time(remaining_bytes / speed)
+            return '~'
         except:
             return '~'
 

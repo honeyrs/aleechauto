@@ -7,7 +7,7 @@ from pyrogram.types import Message
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
 from time import time
 
-from bot import bot, bot_dict, bot_lock, config_dict, LOGGER
+from bot import bot, bot_lock, config_dict, LOGGER
 from bot.helper.ext_utils.bot_utils import sync_to_async
 from bot.helper.ext_utils.files_utils import clean_target, get_path_size
 from bot.helper.ext_utils.media_utils import get_document_type, get_media_info, create_thumbnail
@@ -23,7 +23,7 @@ class TgUploader:
         self._last_uploaded = 0
         self._processed_bytes = 0
         self._is_cancelled = False
-        self._thumb = None  # Defer thumbnail check to async method
+        self._thumb = None
         self._msgs_dict = {}
         self._is_corrupted = False
         self._client = None
@@ -31,10 +31,8 @@ class TgUploader:
         self._leech_log = config_dict['LEECH_LOG']
 
     async def _msg_to_reply(self):
-        """Set the initial message to reply to and check thumbnail."""
         try:
             self._send_msg = self._listener.message
-            # Check thumbnail asynchronously
             if self._listener.thumb and await aiopath.exists(self._listener.thumb):
                 self._thumb = self._listener.thumb
             else:
@@ -54,7 +52,7 @@ class TgUploader:
     async def upload(self, o_files, m_size):
         await self._msg_to_reply()
         corrupted_files = total_files = 0
-        TELEGRAM_LIMIT = 2097152000  # 2,000 MiB
+        TELEGRAM_LIMIT = 2097152000
         total_parts = len(o_files)
 
         for i, file_path in enumerate(o_files):
@@ -96,11 +94,6 @@ class TgUploader:
                 if self._is_cancelled:
                     return
                 continue
-            finally:
-                if not self._is_cancelled and await aiopath.exists(file_path) and (
-                    not self._listener.seed or self._listener.newDir
-                ):
-                    await clean_target(file_path)
 
         if self._is_cancelled:
             return

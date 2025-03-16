@@ -124,8 +124,8 @@ class TaskListener(TaskConfig):
             size = await get_path_size(up_dir)
 
         o_files, m_size = [], []
-        TELEGRAM_LIMIT = 2097152000  # 2,000 MiB
-        SPLIT_SIZE = 2048000000  # 1.95GB to stay safely under limit
+        TELEGRAM_LIMIT = 2097152000
+        SPLIT_SIZE = 2048000000
 
         if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
             LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts of {SPLIT_SIZE} bytes")
@@ -153,6 +153,7 @@ class TaskListener(TaskConfig):
                     raise FileNotFoundError(f"Missing split file: {f}")
             await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
             LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
+            await clean_download(self.dir)  # Clean only after success
         except AsyncTimeoutError:
             LOGGER.error(f"Upload timeout for MID: {self.mid}")
             await self.onUploadError("Upload timed out after 10 minutes.")
@@ -161,20 +162,19 @@ class TaskListener(TaskConfig):
             LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
             await self.onUploadError(f"Upload failed: {str(e)}")
             return
-
-        await clean_download(self.dir)
-        async with task_dict_lock:
-            task_dict.pop(self.mid, None)
-        async with queue_dict_lock:
-            if self.mid in non_queued_up:
-                non_queued_up.remove(self.mid)
-        await start_from_queued()
+        finally:
+            async with task_dict_lock:
+                task_dict.pop(self.mid, None)
+            async with queue_dict_lock:
+                if self.mid in non_queued_up:
+                    non_queued_up.remove(self.mid)
+            await start_from_queued()
 
     async def _split_file(self, file_path):
         try:
-            TELEGRAM_LIMIT = 2097152000  # 2,000 MiB
-            SPLIT_SIZE = 2048000000  # 1.95GB
-            MIN_PART_SIZE = 10 * 1024 * 1024  # 10MB
+            TELEGRAM_LIMIT = 2097152000
+            SPLIT_SIZE = 2048000000
+            MIN_PART_SIZE = 10 * 1024 * 1024
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
                 LOGGER.info(f"File size {file_size} <= Telegram limit, no splitting needed")
@@ -182,14 +182,14 @@ class TaskListener(TaskConfig):
 
             base_name = ospath.splitext(ospath.basename(file_path))[0]
             output_dir = ospath.dirname(file_path)
-            total_duration = (await get_media_info(file_path))[0]  # Total duration in seconds
-            max_parts = (file_size + SPLIT_SIZE - 1) // SPLIT_SIZE  # Ceiling division
+            total_duration = (await get_media_info(file_path))[0]
+            max_parts = (file_size + SPLIT_SIZE - 1) // SPLIT_SIZE
 
             o_files, m_size = [], []
             total_split_size = 0
             start_time = 0
             part_num = 0
-            size_tolerance = 1024 * 1024  # 1MB tolerance
+            size_tolerance = 1024 * 1024
 
             while total_split_size < file_size - size_tolerance and part_num < max_parts:
                 output_file = ospath.join(output_dir, f"{base_name}_part{part_num:03d}.mkv")

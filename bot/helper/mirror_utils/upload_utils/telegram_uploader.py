@@ -23,7 +23,7 @@ class TgUploader:
         self._last_uploaded = 0
         self._processed_bytes = 0
         self._is_cancelled = False
-        self._thumb = self._listener.thumb if self._listener.thumb and await aiopath.exists(self._listener.thumb) else None
+        self._thumb = None  # Defer thumbnail check to async method
         self._msgs_dict = {}
         self._is_corrupted = False
         self._client = None
@@ -31,10 +31,15 @@ class TgUploader:
         self._leech_log = config_dict['LEECH_LOG']
 
     async def _msg_to_reply(self):
-        """Set the initial message to reply to."""
+        """Set the initial message to reply to and check thumbnail."""
         try:
             self._send_msg = self._listener.message
-            LOGGER.info(f"Set message to reply for MID: {self._listener.mid}")
+            # Check thumbnail asynchronously
+            if self._listener.thumb and await aiopath.exists(self._listener.thumb):
+                self._thumb = self._listener.thumb
+            else:
+                self._thumb = None
+            LOGGER.info(f"Set message to reply and thumb: {self._thumb} for MID: {self._listener.mid}")
         except AttributeError as e:
             LOGGER.error(f"Failed to set message to reply for MID: {self._listener.mid}: {e}")
             raise ValueError("Listener message not found.")

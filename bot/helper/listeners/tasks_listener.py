@@ -20,6 +20,12 @@ class TaskListener(TaskConfig):
         super().__init__()
         self._is_cancelled = False
 
+    async def onDownloadStart(self):
+        """Called when download starts, required by TelegramDownloadHelper."""
+        LOGGER.info(f"Download started for MID: {self.mid}")
+        if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
+            await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
+
     async def onDownloadComplete(self):
         up_path = ospath.join(self.dir, self.name)
         if not await aiopath.exists(up_path):
@@ -194,7 +200,7 @@ class TgUploader:
         self._start_time = time()
         self._processed_bytes = 0
         self._is_cancelled = False
-        self._thumb = listener.thumb  # No await here, defer validation to async method
+        self._thumb = listener.thumb  # Synchronous assignment, no await
         self._msgs_dict = {}
         self._client = None
         self._send_msg = None
@@ -259,7 +265,7 @@ class TgUploader:
             raise FileNotFoundError(f"Upload path missing: {up_path}")
 
         thumb = self._thumb
-        if thumb and not await aiopath.exists(thumb):  # Validate thumb asynchronously here
+        if thumb and not await aiopath.exists(thumb):
             LOGGER.warning(f"Thumbnail {thumb} does not exist, using None")
             thumb = None
 

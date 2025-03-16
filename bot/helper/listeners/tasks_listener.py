@@ -125,7 +125,7 @@ class TaskListener(TaskConfig):
 
         o_files, m_size = [], []
         TELEGRAM_LIMIT = 2097152000  # 2,000 MiB
-        SPLIT_SIZE = TELEGRAM_LIMIT - 20 * 1024 * 1024  # 2,076,180,480 bytes
+        SPLIT_SIZE = 2048000000  # 1.95GB to stay safely under limit
 
         if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
             LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts of {SPLIT_SIZE} bytes")
@@ -173,7 +173,7 @@ class TaskListener(TaskConfig):
     async def _split_file(self, file_path):
         try:
             TELEGRAM_LIMIT = 2097152000  # 2,000 MiB
-            SPLIT_SIZE = TELEGRAM_LIMIT - 20 * 1024 * 1024  # 2,076,180,480 bytes
+            SPLIT_SIZE = 2048000000  # 1.95GB
             MIN_PART_SIZE = 10 * 1024 * 1024  # 10MB
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
@@ -218,7 +218,6 @@ class TaskListener(TaskConfig):
                     o_files.append(output_file)
                     m_size.append(part_size)
                     total_split_size += part_size
-                    # Estimate duration based on size (approximation)
                     part_duration = (part_size / file_size) * total_duration if file_size > 0 else 0
                     start_time += part_duration
                     part_num += 1
@@ -227,7 +226,6 @@ class TaskListener(TaskConfig):
                     LOGGER.error(f"Split part {output_file} not created")
                     return [], []
 
-            # Handle remaining size if significant
             if file_size - total_split_size > MIN_PART_SIZE:
                 output_file = ospath.join(output_dir, f"{base_name}_part{part_num:03d}.mkv")
                 cmd_ffmpeg = [
@@ -235,7 +233,11 @@ class TaskListener(TaskConfig):
                 ]
                 LOGGER.info(f"Running final split cmd: {' '.join(cmd_ffmpeg)}")
                 _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-                if rcode == 0 and await aiopath.exists(output_file):
+                if rcode != 0:
+                    LOGGER.error(f"FFmpeg final split failed for {file_path}: {stderr}")
+                    await clean_target(output_file)
+                    return [], []
+                if await aiopath.exists(output_file):
                     part_size = await get_path_size(output_file)
                     if part_size <= TELEGRAM_LIMIT:
                         o_files.append(output_file)
@@ -245,6 +247,7 @@ class TaskListener(TaskConfig):
                     else:
                         LOGGER.error(f"Final part {output_file} size {part_size} exceeds {TELEGRAM_LIMIT}")
                         await clean_target(output_file)
+                        return [], []
 
             if not o_files:
                 LOGGER.error(f"No valid split files generated for {file_path}")

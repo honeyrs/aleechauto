@@ -23,12 +23,21 @@ class TgUploader:
         self._last_uploaded = 0
         self._processed_bytes = 0
         self._is_cancelled = False
-        self._thumb = self._listener.thumb if self._listener.thumb and aiopath.exists(self._listener.thumb) else None
+        self._thumb = self._listener.thumb if self._listener.thumb and await aiopath.exists(self._listener.thumb) else None
         self._msgs_dict = {}
         self._is_corrupted = False
         self._client = None
         self._send_msg = None
         self._leech_log = config_dict['LEECH_LOG']
+
+    async def _msg_to_reply(self):
+        """Set the initial message to reply to."""
+        try:
+            self._send_msg = self._listener.message
+            LOGGER.info(f"Set message to reply for MID: {self._listener.mid}")
+        except AttributeError as e:
+            LOGGER.error(f"Failed to set message to reply for MID: {self._listener.mid}: {e}")
+            raise ValueError("Listener message not found.")
 
     async def _upload_progress(self, current, _):
         if self._is_cancelled:
@@ -63,6 +72,7 @@ class TgUploader:
                 part_num = i + 1
                 caption = f"{ospath.basename(file_path)} (Part {part_num} of {total_parts})"
                 self._last_uploaded = 0
+                LOGGER.info(f"Starting upload for {file_path} (size: {f_size})")
                 await self._upload_file(caption, file_path)
                 total_files += 1
                 if self._is_cancelled:
@@ -121,7 +131,7 @@ class TgUploader:
                     thumb = None
 
             if self._listener.as_doc or force_document or (not is_video and not is_audio and not is_image):
-                LOGGER.debug(f"Uploading {up_path} as document")
+                LOGGER.info(f"Uploading {up_path} as document")
                 self._send_msg = await self._client.send_document(
                     chat_id=self._send_msg.chat.id,
                     document=up_path,
@@ -132,7 +142,7 @@ class TgUploader:
                     reply_to_message_id=self._send_msg.id
                 )
             elif is_video:
-                LOGGER.debug(f"Uploading {up_path} as video")
+                LOGGER.info(f"Uploading {up_path} as video")
                 duration = (await get_media_info(up_path))[0]
                 self._send_msg = await self._client.send_video(
                     chat_id=self._send_msg.chat.id,
@@ -144,6 +154,18 @@ class TgUploader:
                     progress=self._upload_progress,
                     reply_to_message_id=self._send_msg.id
                 )
+            else:
+                LOGGER.info(f"Uploading {up_path} as document (default)")
+                self._send_msg = await self._client.send_document(
+                    chat_id=self._send_msg.chat.id,
+                    document=up_path,
+                    thumb=thumb,
+                    caption=caption,
+                    disable_notification=True,
+                    progress=self._upload_progress,
+                    reply_to_message_id=self._send_msg.id
+                )
+            LOGGER.info(f"Successfully uploaded {up_path}")
         except Exception as e:
-            LOGGER.error(f"Upload file error: {e}")
+            LOGGER.error(f"Upload file error for {up_path}: {e}")
             raise

@@ -76,6 +76,7 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path):
         TELEGRAM_LIMIT = 2097152000  # 2 GB exact
+        SPLIT_SIZE = 2096000000  # Adjusted to account for MKV overhead
         try:
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
@@ -83,7 +84,7 @@ class TaskListener(TaskConfig):
 
             base_name = ospath.splitext(ospath.basename(file_path))[0]
             output_dir = ospath.dirname(file_path)
-            num_parts = (file_size + TELEGRAM_LIMIT - 1) // TELEGRAM_LIMIT  # Ceiling division
+            num_parts = (file_size + SPLIT_SIZE - 1) // SPLIT_SIZE  # Ceiling division
 
             LOGGER.info(f"Splitting {file_path} (size: {file_size}) into {num_parts} parts with 2 GB cap")
 
@@ -91,16 +92,16 @@ class TaskListener(TaskConfig):
             temp_dir = ospath.join(output_dir, "split_temp")
             await makedirs(temp_dir, exist_ok=True)
 
-            # Use split command for exact byte splitting
+            # Split into exact byte chunks
             chunk_prefix = ospath.join(temp_dir, f"{base_name}_chunk")
-            cmd_split = ['split', '-b', str(TELEGRAM_LIMIT), file_path, chunk_prefix]
+            cmd_split = ['split', '-b', str(SPLIT_SIZE), file_path, chunk_prefix]
             _, stderr, rcode = await cmd_exec(cmd_split)
             if rcode != 0:
                 LOGGER.error(f"Split command failed: {stderr}")
                 await clean_target(temp_dir)
                 return [], []
 
-            # Process split chunks into MKV files
+            # Convert chunks to MKV
             chunk_files = sorted([ospath.join(temp_dir, f) for f in await listdir(temp_dir) if f.startswith(f"{base_name}_chunk")])
             for i, chunk in enumerate(chunk_files):
                 output_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
@@ -191,8 +192,7 @@ class TaskListener(TaskConfig):
             task_dict.pop(self.mid, None)
         if self.isSuperChat and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
-        # Avoid photo parameter to prevent NoneType error
-        await sendingMessage(f"Upload failed: {error}", self.message)
+        await sendingMessage(f"Upload failed: {error}", self.message, None)
         await clean_download(self.dir)
 
 class TgUploader:
@@ -203,7 +203,7 @@ class TgUploader:
         self._start_time = time()
         self._processed_bytes = 0
         self._is_cancelled = False
-        self._thumb = listener.thumb  # Synchronous assignment
+        self._thumb = listener.thumb
         self._msgs_dict = {}
         self._client = None
         self._send_msg = None

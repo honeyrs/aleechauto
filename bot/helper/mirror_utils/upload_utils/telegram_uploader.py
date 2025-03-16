@@ -144,7 +144,7 @@ class TgUploader:
                     progress=self._upload_progress,
                     reply_to_message_id=self._send_msg.id
                 )
-            # Note: Incomplete original code truncated here; assuming typical video upload logic
+            # Note: Original code truncated; assuming typical video upload logic
         except Exception as e:
             LOGGER.error(f"Upload file error: {e}")
             raise

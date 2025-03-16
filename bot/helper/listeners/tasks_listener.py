@@ -21,6 +21,7 @@ from bot.helper.mirror_utils.status_utils.telegram_status import TelegramStatus
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import sendingMessage, update_status_message, copyMessage, auto_delete_message
 from bot.helper.video_utils.executor import VidEcxecutor
+from bot.helper.ext_utils.media_utils import get_media_info
 
 class TaskListener(TaskConfig):
     def __init__(self):
@@ -174,37 +175,50 @@ class TaskListener(TaskConfig):
             TELEGRAM_LIMIT = 2097152000  # 2,000 MiB
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
+                LOGGER.info(f"File size {file_size} <= Telegram limit, no splitting needed")
                 return [file_path], [file_size]
 
             base_name = ospath.splitext(ospath.basename(file_path))[0]
             split_size = TELEGRAM_LIMIT - 20 * 1024 * 1024  # 2,076,180,480 bytes
             output_dir = ospath.dirname(file_path)
 
-            # Use FFmpeg to split into parts
-            output_pattern = ospath.join(output_dir, f"{base_name}_part%03d.mkv")
-            cmd_ffmpeg = [
-                'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
-                '-f', 'segment', '-segment_size', str(split_size),
-                '-reset_timestamps', '1', output_pattern, '-y'
-            ]
-            _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-            if rcode != 0:
-                LOGGER.error(f"FFmpeg split failed for {file_path}: {stderr}")
-                return [], []
-
-            # Collect split files
             o_files, m_size = [], []
-            for i in range(1000):  # Reasonable upper limit for parts
-                part_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
-                if not await aiopath.exists(part_file):
-                    break
-                part_size = await get_path_size(part_file)
-                if part_size <= TELEGRAM_LIMIT:
-                    o_files.append(part_file)
-                    m_size.append(part_size)
+            remaining_size = file_size
+            part_num = 0
+            start_time = 0
+            total_duration = (await get_media_info(file_path))[0]  # Get total duration in seconds
+
+            while remaining_size > 0:
+                output_file = ospath.join(output_dir, f"{base_name}_part{part_num:03d}.mkv")
+                cmd_ffmpeg = [
+                    'ffmpeg', '-i', file_path, '-ss', str(start_time), '-fs', str(split_size),
+                    '-c', 'copy', '-map', '0', output_file, '-y'
+                ]
+                LOGGER.info(f"Running split cmd: {' '.join(cmd_ffmpeg)}")
+                _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
+                if rcode != 0:
+                    LOGGER.error(f"FFmpeg split failed for {file_path} part {part_num}: {stderr}")
+                    await clean_target(output_file)
+                    return [], []
+
+                if await aiopath.exists(output_file):
+                    part_size = await get_path_size(output_file)
+                    LOGGER.info(f"Generated split file: {output_file} with size: {part_size}")
+                    if part_size <= TELEGRAM_LIMIT:
+                        o_files.append(output_file)
+                        m_size.append(part_size)
+                        remaining_size -= part_size
+                        # Estimate duration of this part (approximation based on size)
+                        part_duration = (part_size / file_size) * total_duration if file_size > 0 else 0
+                        start_time += part_duration
+                        part_num += 1
+                    else:
+                        LOGGER.error(f"Part {output_file} size {part_size} exceeds {TELEGRAM_LIMIT} bytes")
+                        await clean_target(output_file)
+                        return [], []
                 else:
-                    LOGGER.warning(f"Part {part_file} exceeds {TELEGRAM_LIMIT} bytes, removing")
-                    await clean_target(part_file)
+                    LOGGER.error(f"Split part {output_file} not created")
+                    return [], []
 
             if not o_files:
                 LOGGER.error(f"No valid split files generated for {file_path}")

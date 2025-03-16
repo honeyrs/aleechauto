@@ -21,7 +21,6 @@ class TaskListener(TaskConfig):
         self._is_cancelled = False
 
     async def onDownloadStart(self):
-        """Called when download starts, required by TelegramDownloadHelper."""
         LOGGER.info(f"Download started for MID: {self.mid}")
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
@@ -32,6 +31,7 @@ class TaskListener(TaskConfig):
             try:
                 files = await listdir(self.dir)
                 self.name = files[-1] if files else self.name
+                up_path = ospath.join(self.dir, self.name)
             except Exception as e:
                 await self.onUploadError(f"File not found: {str(e)}")
                 return
@@ -83,47 +83,48 @@ class TaskListener(TaskConfig):
 
             base_name = ospath.splitext(ospath.basename(file_path))[0]
             output_dir = ospath.dirname(file_path)
-            num_full_parts = file_size // TELEGRAM_LIMIT
-            remainder_size = file_size % TELEGRAM_LIMIT
+            num_parts = (file_size + TELEGRAM_LIMIT - 1) // TELEGRAM_LIMIT  # Ceiling division
 
-            LOGGER.info(f"Splitting {file_path} (size: {file_size}) into {num_full_parts} full 2 GB parts and remainder {remainder_size}")
+            LOGGER.info(f"Splitting {file_path} (size: {file_size}) into {num_parts} parts with 2 GB cap")
 
             o_files, m_size = [], []
-            duration = (await get_media_info(file_path))[0] or (file_size / 1000000)  # Fallback bitrate
-            bytes_per_second = file_size / duration
+            temp_dir = ospath.join(output_dir, "split_temp")
+            await makedirs(temp_dir, exist_ok=True)
 
-            for i in range(num_full_parts):
+            # Use split command for exact byte splitting
+            chunk_prefix = ospath.join(temp_dir, f"{base_name}_chunk")
+            cmd_split = ['split', '-b', str(TELEGRAM_LIMIT), file_path, chunk_prefix]
+            _, stderr, rcode = await cmd_exec(cmd_split)
+            if rcode != 0:
+                LOGGER.error(f"Split command failed: {stderr}")
+                await clean_target(temp_dir)
+                return [], []
+
+            # Process split chunks into MKV files
+            chunk_files = sorted([ospath.join(temp_dir, f) for f in await listdir(temp_dir) if f.startswith(f"{base_name}_chunk")])
+            for i, chunk in enumerate(chunk_files):
                 output_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
-                start_time = i * (TELEGRAM_LIMIT / bytes_per_second)
-                part_duration = TELEGRAM_LIMIT / bytes_per_second
-
-                cmd = ['ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
-                       '-c', 'copy', '-map', '0', '-f', 'matroska', output_file, '-y']
-                _, stderr, rcode = await cmd_exec(cmd)
+                cmd_ffmpeg = [
+                    'ffmpeg', '-i', chunk, '-c', 'copy', '-map', '0',
+                    '-f', 'matroska', output_file, '-y'
+                ]
+                _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
                 if rcode != 0:
-                    LOGGER.error(f"FFmpeg split failed for part {i}: {stderr}")
-                    await self._cleanup_files(o_files)
+                    LOGGER.error(f"FFmpeg conversion failed for {chunk}: {stderr}")
+                    await clean_target(output_file)
+                    await clean_target(temp_dir)
                     return [], []
 
                 part_size = await get_path_size(output_file)
-                o_files.append(output_file)
-                m_size.append(part_size)
-
-            if remainder_size > 0:
-                output_file = ospath.join(output_dir, f"{base_name}_part{num_full_parts:03d}.mkv")
-                start_time = num_full_parts * (TELEGRAM_LIMIT / bytes_per_second)
-                cmd = ['ffmpeg', '-i', file_path, '-ss', str(start_time),
-                       '-c', 'copy', '-map', '0', '-f', 'matroska', output_file, '-y']
-                _, stderr, rcode = await cmd_exec(cmd)
-                if rcode != 0:
-                    LOGGER.error(f"FFmpeg split failed for remainder: {stderr}")
-                    await self._cleanup_files(o_files)
+                if part_size > TELEGRAM_LIMIT:
+                    LOGGER.error(f"Part {output_file} size {part_size} exceeds 2 GB")
+                    await clean_target(output_file)
+                    await clean_target(temp_dir)
                     return [], []
-
-                part_size = await get_path_size(output_file)
                 o_files.append(output_file)
                 m_size.append(part_size)
 
+            await clean_target(temp_dir)
             total_split_size = sum(m_size)
             if total_split_size != file_size:
                 LOGGER.error(f"Split size mismatch: original={file_size}, split_total={total_split_size}")
@@ -135,6 +136,7 @@ class TaskListener(TaskConfig):
         except Exception as e:
             LOGGER.error(f"Error splitting {file_path}: {e}", exc_info=True)
             await self._cleanup_files(o_files if 'o_files' in locals() else [])
+            await clean_target(temp_dir if 'temp_dir' in locals() else None)
             return [], []
 
     async def _cleanup_files(self, files):
@@ -189,7 +191,8 @@ class TaskListener(TaskConfig):
             task_dict.pop(self.mid, None)
         if self.isSuperChat and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
-        await sendingMessage(f"Upload failed: {error}", self.message, None)
+        # Avoid photo parameter to prevent NoneType error
+        await sendingMessage(f"Upload failed: {error}", self.message)
         await clean_download(self.dir)
 
 class TgUploader:
@@ -200,7 +203,7 @@ class TgUploader:
         self._start_time = time()
         self._processed_bytes = 0
         self._is_cancelled = False
-        self._thumb = listener.thumb  # Synchronous assignment, no await
+        self._thumb = listener.thumb  # Synchronous assignment
         self._msgs_dict = {}
         self._client = None
         self._send_msg = None
@@ -245,7 +248,7 @@ class TgUploader:
             await self._listener.onUploadError("No files uploaded successfully!")
             return
         if uploaded_files < total_files:
-            await self._listener.onUploadError(f"Only {uploaded_files}/{total_files} files uploaded successfully. Check logs!")
+            await self._listener.onUploadError(f"Only {uploaded_files}/{total_files} files uploaded successfully!")
             return
 
         if sum(m_size) != self._size:

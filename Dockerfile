@@ -1,4 +1,6 @@
-FROM anasty17/mltb:latest
+FROM mysterysd/wzmlx:latestv3
+
+#FROM anasty17/mltb:latest
 #FROM mysterysd/wzmlx:latest
 
 

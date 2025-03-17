@@ -1,3 +1,4 @@
+pycryptodome
 pytz
 mimetype
 typing

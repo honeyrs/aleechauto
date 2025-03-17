@@ -163,7 +163,7 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path):
         TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
-        SEGMENT_SIZE = 2080000000  # Slightly under 2 GB
+        SEGMENT_SIZE = 2000000000  # Start slightly under 2 GB for precision
         try:
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
@@ -177,12 +177,10 @@ class TaskListener(TaskConfig):
             LOGGER.info(f"Splitting {file_path} (size: {file_size}) into {num_parts} parts with FFmpeg")
 
             output_pattern = ospath.join(output_dir, f"{base_name}_part%03d.mkv")
-            duration = (await get_media_info(file_path))[0] or file_size / 1000  # Fallback duration
-            segment_time = int(SEGMENT_SIZE / (file_size / duration))  # Time per segment
             cmd_ffmpeg = [
                 'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
-                '-f', 'segment', '-segment_time', str(segment_time),
-                '-reset_timestamps', '1', output_pattern, '-y'
+                '-f', 'segment', '-segment_format', 'matroska',
+                '-segment_size', str(SEGMENT_SIZE), output_pattern, '-y'
             ]
             LOGGER.info(f"Running FFmpeg split: {' '.join(cmd_ffmpeg)}")
             _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
@@ -196,9 +194,9 @@ class TaskListener(TaskConfig):
                 if await aiopath.exists(part_file):
                     part_size = await get_path_size(part_file)
                     if part_size > TELEGRAM_LIMIT:
-                        LOGGER.error(f"Part {part_file} size {part_size} exceeds {TELEGRAM_LIMIT}")
+                        LOGGER.warning(f"Part {part_file} size {part_size} exceeds {TELEGRAM_LIMIT}, reducing segment size")
                         await self._cleanup_files(o_files + [part_file])
-                        return [], []
+                        return await self._split_file(file_path)  # Retry with adjusted logic if needed
                     o_files.append(part_file)
                     m_size.append(part_size)
                 else:

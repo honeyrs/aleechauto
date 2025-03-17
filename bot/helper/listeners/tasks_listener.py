@@ -163,7 +163,7 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path):
         TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
-        SEGMENT_SIZE = 2000000000  # Slightly under 2 GB for safety
+        SEGMENT_SIZE = 2000000000  # Slightly under 2 GB
         try:
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
@@ -177,8 +177,10 @@ class TaskListener(TaskConfig):
             LOGGER.info(f"Splitting {file_path} (size: {file_size}) into {num_parts} parts with FFmpeg")
 
             o_files, m_size = [], []
-            start_pos = 0
-            remaining_size = file_size
+            bytes_per_part = file_size // num_parts
+            if bytes_per_part > TELEGRAM_LIMIT:
+                bytes_per_part = TELEGRAM_LIMIT
+                num_parts = (file_size + bytes_per_part - 1) // bytes_per_part
 
             for i in range(num_parts):
                 if self._is_cancelled:
@@ -186,10 +188,14 @@ class TaskListener(TaskConfig):
                     await self._cleanup_files(o_files)
                     return [], []
                 output_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
-                segment_size = min(SEGMENT_SIZE, remaining_size)  # Last part may be smaller
+                start_byte = i * bytes_per_part
+                end_byte = min((i + 1) * bytes_per_part, file_size) if i < num_parts - 1 else file_size
+                byte_count = end_byte - start_byte
+
                 cmd_ffmpeg = [
-                    'ffmpeg', '-i', file_path, '-fs', str(segment_size), '-ss', str(start_pos),
-                    '-c', 'copy', '-map', '0', '-f', 'matroska', output_file, '-y'
+                    'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
+                    '-ss', str(start_byte / (file_size / (await get_media_info(file_path))[0])),
+                    '-fs', str(byte_count), output_file, '-y'
                 ]
                 LOGGER.info(f"Running FFmpeg split: {' '.join(cmd_ffmpeg)}")
                 _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
@@ -206,9 +212,6 @@ class TaskListener(TaskConfig):
                         return [], []
                     o_files.append(output_file)
                     m_size.append(part_size)
-                    duration = (await get_media_info(file_path))[0] or file_size / 1000  # Fallback
-                    start_pos += (part_size / (file_size / duration)) if duration else part_size / 1000
-                    remaining_size -= part_size
                 else:
                     LOGGER.error(f"Part {output_file} not created")
                     await self._cleanup_files(o_files)
@@ -216,9 +219,9 @@ class TaskListener(TaskConfig):
 
             total_split_size = sum(m_size)
             if abs(total_split_size - file_size) > 1024 * 1024:  # 1 MB tolerance
-                LOGGER.error(f"Split size mismatch: original={file_size}, split_total={total_split_size}")
+                LOGGER.warning(f"Split size mismatch: original={file_size}, split_total={total_split_size}. Retrying with adjustment.")
                 await self._cleanup_files(o_files)
-                return [], []
+                return await self._split_file(file_path)  # Retry if significant mismatch
 
             LOGGER.info(f"Split {file_path} into {len(o_files)} parts: {o_files}")
             return o_files, m_size

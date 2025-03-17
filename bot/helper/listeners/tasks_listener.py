@@ -163,7 +163,7 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path):
         TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
-        SEGMENT_SIZE = 2000000000  # Start slightly under 2 GB for precision
+        SEGMENT_SIZE = 2000000000  # Slightly under 2 GB for safety
         try:
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
@@ -176,31 +176,41 @@ class TaskListener(TaskConfig):
 
             LOGGER.info(f"Splitting {file_path} (size: {file_size}) into {num_parts} parts with FFmpeg")
 
-            output_pattern = ospath.join(output_dir, f"{base_name}_part%03d.mkv")
-            cmd_ffmpeg = [
-                'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
-                '-f', 'segment', '-segment_format', 'matroska',
-                '-segment_size', str(SEGMENT_SIZE), output_pattern, '-y'
-            ]
-            LOGGER.info(f"Running FFmpeg split: {' '.join(cmd_ffmpeg)}")
-            _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-            if rcode != 0:
-                LOGGER.error(f"FFmpeg split failed: {stderr}")
-                return [], []
-
             o_files, m_size = [], []
+            start_pos = 0
+            remaining_size = file_size
+
             for i in range(num_parts):
-                part_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
-                if await aiopath.exists(part_file):
-                    part_size = await get_path_size(part_file)
+                if self._is_cancelled:
+                    LOGGER.info(f"Split cancelled for {file_path}")
+                    await self._cleanup_files(o_files)
+                    return [], []
+                output_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
+                segment_size = min(SEGMENT_SIZE, remaining_size)  # Last part may be smaller
+                cmd_ffmpeg = [
+                    'ffmpeg', '-i', file_path, '-fs', str(segment_size), '-ss', str(start_pos),
+                    '-c', 'copy', '-map', '0', '-f', 'matroska', output_file, '-y'
+                ]
+                LOGGER.info(f"Running FFmpeg split: {' '.join(cmd_ffmpeg)}")
+                _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
+                if rcode != 0:
+                    LOGGER.error(f"FFmpeg split failed for part {i}: {stderr}")
+                    await self._cleanup_files(o_files)
+                    return [], []
+
+                if await aiopath.exists(output_file):
+                    part_size = await get_path_size(output_file)
                     if part_size > TELEGRAM_LIMIT:
-                        LOGGER.warning(f"Part {part_file} size {part_size} exceeds {TELEGRAM_LIMIT}, reducing segment size")
-                        await self._cleanup_files(o_files + [part_file])
-                        return await self._split_file(file_path)  # Retry with adjusted logic if needed
-                    o_files.append(part_file)
+                        LOGGER.error(f"Part {output_file} size {part_size} exceeds {TELEGRAM_LIMIT}")
+                        await self._cleanup_files(o_files)
+                        return [], []
+                    o_files.append(output_file)
                     m_size.append(part_size)
+                    duration = (await get_media_info(file_path))[0] or file_size / 1000  # Fallback
+                    start_pos += (part_size / (file_size / duration)) if duration else part_size / 1000
+                    remaining_size -= part_size
                 else:
-                    LOGGER.error(f"Part {part_file} not created")
+                    LOGGER.error(f"Part {output_file} not created")
                     await self._cleanup_files(o_files)
                     return [], []
 

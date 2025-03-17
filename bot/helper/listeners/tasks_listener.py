@@ -4,9 +4,9 @@ from html import escape
 from os import path as ospath
 from time import time
 
-from bot import bot, bot_loop, task_dict, task_dict_lock, config_dict, non_queued_up, non_queued_dl, queued_up, queued_dl, queue_dict_lock, LOGGER, DATABASE_URL, bot_lock
+from bot import bot, bot_loop, task_dict, task_dict_lock, config_dict, non_queued_up, non_queued_dl, queued_up, queued_dl, queue_dict_lock, LOGGER, DATABASE_URL, bot_lock, DEFAULT_SPLIT_SIZE
 from bot.helper.common import TaskConfig
-from bot.helper.ext_utils.bot_utils import cmd_exec, sync_to_async
+from bot.helper.ext_utils.bot_utils import cmd_exec, sync_to_async, is_premium_user
 from bot.helper.ext_utils.db_handler import DbManager
 from bot.helper.ext_utils.files_utils import get_path_size, clean_download, clean_target, join_files
 from bot.helper.ext_utils.links_utils import is_magnet, is_url, get_link
@@ -116,8 +116,8 @@ class TaskListener(TaskConfig):
 
         o_files, m_size = [], []
         if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
-            LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts maximized to 2 GB")
-            o_files, m_size = await self._split_file(up_path)
+            LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts")
+            o_files, m_size = await self._split_file(up_path, size, gid)
             if not o_files:
                 await self.onUploadError(f"Failed to split {self.name} into parts.")
                 return
@@ -160,73 +160,62 @@ class TaskListener(TaskConfig):
                     non_queued_up.remove(self.mid)
             await start_from_queued()
 
-    async def _split_file(self, file_path):
-        TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
-        TARGET_SIZE = 1887436800  # 1.8 GB (~90% of 2 GB) for VBR safety
+    async def _split_file(self, file_path, size, gid):
+        """Split logic adapted from parent project's proceedSplit"""
+        # Determine split size based on user type and config
+        split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
+        if is_premium_user(self.user_id):
+            split_size = max(split_size, 4 * 1024**3)  # 4GB for premium users
+        else:
+            split_size = min(split_size, 2 * 1024**3)  # Cap at 2GB for basic users
 
+        LOGGER.info(f"Splitting {file_path} (size: {size}) with split_size: {split_size}")
+
+        # If file is smaller than split_size, no split needed
+        if size <= split_size:
+            LOGGER.info(f"File size {size} <= split_size {split_size}, no split required")
+            return [file_path], [size]
+
+        # Prepare output
+        o_files, m_size = [], []
+        base_name = ospath.splitext(ospath.basename(file_path))[0]
+        output_dir = ospath.dirname(file_path)
+
+        # Split file into parts
         try:
-            file_size = await get_path_size(file_path)
-            if file_size <= TELEGRAM_LIMIT:
-                LOGGER.info(f"File {file_path} size {file_size} <= {TELEGRAM_LIMIT}, no split needed")
-                return [file_path], [file_size]
+            num_parts = (size + split_size - 1) // split_size  # Ceiling division
+            part_size_target = size // num_parts  # Aim for equal parts where possible
 
-            base_name = ospath.splitext(ospath.basename(file_path))[0]
-            output_dir = ospath.dirname(file_path)
-            duration = (await get_media_info(file_path))[0]
-            if not duration:
-                LOGGER.warning(f"Could not get duration for {file_path}, using fallback")
-                duration = file_size / 1000000  # Rough estimate in seconds
-            avg_bitrate = file_size / duration  # bytes/s
+            for part in range(num_parts):
+                output_file = ospath.join(output_dir, f"{base_name}_part{part:03d}{ospath.splitext(file_path)[1]}")
+                start_byte = part * part_size_target
+                end_byte = min((part + 1) * part_size_target, size)
 
-            LOGGER.info(f"Splitting {file_path} (size: {file_size}, duration: {duration}s) into parts maximized to {TARGET_SIZE} bytes")
-            o_files, m_size = [], []
-            start_time = 0
-            remaining_size = file_size
-
-            while remaining_size > 0:
-                part_duration = min(TARGET_SIZE / avg_bitrate, duration - start_time)
-                output_file = ospath.join(output_dir, f"{base_name}_part{len(o_files):03d}.mkv")
-                cmd_ffmpeg = [
-                    'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
-                    '-c', 'copy', '-map', '0', output_file, '-y'
-                ]
-                LOGGER.info(f"Running FFmpeg: {' '.join(cmd_ffmpeg)}")
-                _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
+                # Use dd or similar for splitting (async-friendly)
+                cmd = ['dd', f'if={file_path}', f'of={output_file}', f'bs={part_size_target}', f'skip={part}', 'count=1', 'status=none']
+                _, stderr, rcode = await cmd_exec(cmd)
                 if rcode != 0:
-                    LOGGER.error(f"FFmpeg split failed: {stderr}")
+                    LOGGER.error(f"Split failed for part {part}: {stderr}")
                     await self._cleanup_files(o_files)
                     return [], []
 
                 if not await aiopath.exists(output_file):
-                    LOGGER.error(f"Part {output_file} not created - possible corruption")
+                    LOGGER.error(f"Part {output_file} not created")
                     await self._cleanup_files(o_files)
                     return [], []
 
                 part_size = await get_path_size(output_file)
-                if part_size > TELEGRAM_LIMIT:
-                    LOGGER.warning(f"Part {output_file} size {part_size} exceeds {TELEGRAM_LIMIT}, adjusting")
-                    part_duration *= (TARGET_SIZE / part_size) * 0.95  # Extra 5% buffer
-                    await clean_target(output_file)
-                    cmd_ffmpeg = [
-                        'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
-                        '-c', 'copy', '-map', '0', output_file, '-y'
-                    ]
-                    LOGGER.info(f"Retrying FFmpeg: {' '.join(cmd_ffmpeg)}")
-                    _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-                    if rcode != 0 or not await aiopath.exists(output_file):
-                        LOGGER.error(f"Retry failed: {stderr}")
-                        await self._cleanup_files(o_files)
-                        return [], []
-                    part_size = await get_path_size(output_file)
+                if part_size > split_size:
+                    LOGGER.warning(f"Part {output_file} size {part_size} exceeds split_size {split_size}, retrying not implemented")
+                    await self._cleanup_files(o_files)
+                    return [], []
 
                 o_files.append(output_file)
                 m_size.append(part_size)
-                start_time += part_duration
-                remaining_size -= part_size
 
             total_split_size = sum(m_size)
-            if abs(total_split_size - file_size) > 1024 * 1024:  # 1 MB tolerance
-                LOGGER.error(f"Split size mismatch: original={file_size}, split_total={total_split_size}")
+            if abs(total_split_size - size) > 1024 * 1024:  # 1MB tolerance
+                LOGGER.error(f"Split size mismatch: original={size}, split_total={total_split_size}")
                 await self._cleanup_files(o_files)
                 return [], []
 

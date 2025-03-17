@@ -162,7 +162,7 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path):
         TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
-        TARGET_SIZE = int(TELEGRAM_LIMIT * 0.95)  # 95% of 2 GB for safety
+        TARGET_SIZE = 1887436800  # 1.8 GB (~90% of 2 GB) for VBR safety
 
         try:
             file_size = await get_path_size(file_path)
@@ -205,10 +205,12 @@ class TaskListener(TaskConfig):
                 part_size = await get_path_size(output_file)
                 if part_size > TELEGRAM_LIMIT:
                     LOGGER.warning(f"Part {output_file} size {part_size} exceeds {TELEGRAM_LIMIT}, adjusting")
-                    # Adjust duration down and retry
-                    part_duration *= (TARGET_SIZE / part_size)
+                    part_duration *= (TARGET_SIZE / part_size) * 0.95  # Extra 5% buffer
                     await clean_target(output_file)
-                    cmd_ffmpeg[5] = str(part_duration)  # Update -t
+                    cmd_ffmpeg = [
+                        'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
+                        '-c', 'copy', '-map', '0', output_file, '-y'
+                    ]
                     LOGGER.info(f"Retrying FFmpeg: {' '.join(cmd_ffmpeg)}")
                     _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
                     if rcode != 0 or not await aiopath.exists(output_file):

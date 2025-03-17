@@ -35,7 +35,6 @@ class TaskListener(TaskConfig):
             self.name = task.name()
             gid = task.gid()
 
-        # Handle multi-task (sameDir) consolidation
         if self.sameDir and self.mid in self.sameDir['tasks']:
             folder_name = self.sameDir['name']
             des_path = ospath.join(self.dir, folder_name)
@@ -117,7 +116,7 @@ class TaskListener(TaskConfig):
 
         o_files, m_size = [], []
         if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
-            LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts under 2 GB")
+            LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts maximized to 2 GB")
             o_files, m_size = await self._split_file(up_path)
             if not o_files:
                 await self.onUploadError(f"Failed to split {self.name} into parts.")
@@ -163,7 +162,7 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path):
         TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
-        TARGET_SIZES = [2040109466, 1992294400, 1887436800]  # 1.95 GB, 1.9 GB, 1.8 GB
+        TARGET_SIZE = TELEGRAM_LIMIT  # Maximize to full 2 GB
 
         try:
             file_size = await get_path_size(file_path)
@@ -177,76 +176,48 @@ class TaskListener(TaskConfig):
             if not duration:
                 LOGGER.warning(f"Could not get duration for {file_path}, using fallback")
                 duration = file_size / 1000000  # Rough estimate in seconds
+            avg_bitrate = file_size / duration  # bytes/s
 
+            LOGGER.info(f"Splitting {file_path} (size: {file_size}) into parts maximized to {TELEGRAM_LIMIT} bytes")
             o_files, m_size = [], []
-            for attempt, target_size in enumerate(TARGET_SIZES):
-                num_parts = (file_size + target_size - 1) // target_size  # ceil division
-                segment_time = duration / num_parts
-                LOGGER.info(f"Attempt {attempt + 1}: Splitting {file_path} (size: {file_size}) into {num_parts} parts of ~{segment_time:.2f}s each, targeting {target_size} bytes")
+            start_time = 0
+            remaining_size = file_size
 
-                temp_files = []
-                for i in range(num_parts):
-                    start_time = i * segment_time
-                    remaining_time = duration - start_time
-                    part_duration = min(segment_time, remaining_time)  # Adjust last part
-                    output_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
-                    cmd_ffmpeg = [
-                        'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
-                        '-c', 'copy', '-map', '0', output_file, '-y'
-                    ]
-                    LOGGER.info(f"Running FFmpeg: {' '.join(cmd_ffmpeg)}")
-                    _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-                    if rcode != 0:
-                        LOGGER.error(f"FFmpeg split failed for part {i}: {stderr}")
-                        await self._cleanup_files(temp_files)
-                        return [], []
+            while remaining_size > 0:
+                # Estimate duration for max size
+                target_part_size = min(TARGET_SIZE, remaining_size)
+                part_duration = target_part_size / avg_bitrate
+                if part_duration > duration - start_time:
+                    part_duration = duration - start_time
 
-                    if not await aiopath.exists(output_file):
-                        LOGGER.error(f"Part {output_file} not created - possible corruption")
-                        await self._cleanup_files(temp_files)
-                        return [], []
-                    temp_files.append(output_file)
-
-                # Check sizes
-                o_files = temp_files
-                m_size = [await get_path_size(f) for f in o_files]
-                if any(size > TELEGRAM_LIMIT for size in m_size):
-                    LOGGER.warning(f"Attempt {attempt + 1} failed: Oversized parts {[(f, s) for f, s in zip(o_files, m_size) if s > TELEGRAM_LIMIT]}")
-                    await self._cleanup_files(o_files)
-                    continue  # Retry next target
-                break  # Success - all parts under 2 GB
-            else:
-                # All attempts failed - final fallback with max bitrate
-                LOGGER.warning(f"All target sizes failed, using max bitrate adjustment for {file_path}")
-                max_bitrate = max(size / (duration / num_parts) for size in m_size)  # From last attempt
-                segment_time = TELEGRAM_LIMIT / max_bitrate
-                num_parts = int(duration / segment_time) + 1
-                LOGGER.info(f"Fallback: Splitting into {num_parts} parts with ~{segment_time:.2f}s each")
-
-                o_files = []
-                for i in range(num_parts):
-                    start_time = i * segment_time
-                    remaining_time = duration - start_time
-                    part_duration = min(segment_time, remaining_time)
-                    output_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
-                    cmd_ffmpeg = [
-                        'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
-                        '-c', 'copy', '-map', '0', output_file, '-y'
-                    ]
-                    _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-                    if rcode != 0 or not await aiopath.exists(output_file):
-                        LOGGER.error(f"Fallback split failed for part {i}: {stderr or 'file missing'}")
-                        await self._cleanup_files(o_files)
-                        return [], []
-                    o_files.append(output_file)
-
-                m_size = [await get_path_size(f) for f in o_files]
-                if any(size > TELEGRAM_LIMIT for size in m_size):
-                    LOGGER.error(f"Final fallback failed: Parts still exceed {TELEGRAM_LIMIT}")
+                output_file = ospath.join(output_dir, f"{base_name}_part{len(o_files):03d}.mkv")
+                cmd_ffmpeg = [
+                    'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
+                    '-c', 'copy', '-map', '0', output_file, '-y'
+                ]
+                LOGGER.info(f"Running FFmpeg: {' '.join(cmd_ffmpeg)}")
+                _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
+                if rcode != 0:
+                    LOGGER.error(f"FFmpeg split failed: {stderr}")
                     await self._cleanup_files(o_files)
                     return [], []
 
-            # Verify total size
+                if not await aiopath.exists(output_file):
+                    LOGGER.error(f"Part {output_file} not created - possible corruption")
+                    await self._cleanup_files(o_files)
+                    return [], []
+
+                part_size = await get_path_size(output_file)
+                if part_size > TELEGRAM_LIMIT:
+                    LOGGER.error(f"Part {output_file} size {part_size} exceeds {TELEGRAM_LIMIT}")
+                    await self._cleanup_files(o_files)
+                    return [], []
+
+                o_files.append(output_file)
+                m_size.append(part_size)
+                start_time += part_duration
+                remaining_size -= part_size
+
             total_split_size = sum(m_size)
             if abs(total_split_size - file_size) > 1024 * 1024:  # 1 MB tolerance
                 LOGGER.error(f"Split size mismatch: original={file_size}, split_total={total_split_size}")

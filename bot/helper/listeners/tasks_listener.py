@@ -163,7 +163,7 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path):
         TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
-        SEGMENT_SIZE = 2080000000  # Slightly under 2 GB to ensure compliance
+        SEGMENT_SIZE = 2080000000  # Slightly under 2 GB
         try:
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
@@ -177,9 +177,11 @@ class TaskListener(TaskConfig):
             LOGGER.info(f"Splitting {file_path} (size: {file_size}) into {num_parts} parts with FFmpeg")
 
             output_pattern = ospath.join(output_dir, f"{base_name}_part%03d.mkv")
+            duration = (await get_media_info(file_path))[0] or file_size / 1000  # Fallback duration
+            segment_time = int(SEGMENT_SIZE / (file_size / duration))  # Time per segment
             cmd_ffmpeg = [
                 'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
-                '-f', 'segment', '-segment_time', str(int(SEGMENT_SIZE / (file_size / (await get_media_info(file_path))[0]))),
+                '-f', 'segment', '-segment_time', str(segment_time),
                 '-reset_timestamps', '1', output_pattern, '-y'
             ]
             LOGGER.info(f"Running FFmpeg split: {' '.join(cmd_ffmpeg)}")
@@ -213,7 +215,7 @@ class TaskListener(TaskConfig):
             LOGGER.info(f"Split {file_path} into {len(o_files)} parts: {o_files}")
             return o_files, m_size
         except Exception as e:
-            LOGGER.error(f"Error splitting {file_path}: {e frowning face", exc_info=True)
+            LOGGER.error(f"Error splitting {file_path}: {e}", exc_info=True)
             await self._cleanup_files(o_files if 'o_files' in locals() else [])
             return [], []
 

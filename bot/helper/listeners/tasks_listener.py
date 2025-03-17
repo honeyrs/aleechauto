@@ -162,7 +162,7 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path):
         TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
-        TARGET_SIZE = TELEGRAM_LIMIT - 1024 * 1024  # 1 MB buffer under 2 GB
+        TARGET_SIZE = int(TELEGRAM_LIMIT * 0.95)  # 95% of 2 GB for safety
 
         try:
             file_size = await get_path_size(file_path)
@@ -184,52 +184,38 @@ class TaskListener(TaskConfig):
             remaining_size = file_size
 
             while remaining_size > 0:
-                # Initial estimate for 2 GB part
-                est_duration = TARGET_SIZE / avg_bitrate if remaining_size > TARGET_SIZE else duration - start_time
+                part_duration = min(TARGET_SIZE / avg_bitrate, duration - start_time)
                 output_file = ospath.join(output_dir, f"{base_name}_part{len(o_files):03d}.mkv")
-                
-                # Binary search to fine-tune duration
-                low, high = 0, est_duration
-                part_size = 0
-                for _ in range(10):  # 10 iterations for precision
-                    mid = (low + high) / 2
-                    cmd_ffmpeg = [
-                        'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(mid),
-                        '-c', 'copy', '-map', '0', output_file, '-y'
-                    ]
-                    _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-                    if rcode != 0 or not await aiopath.exists(output_file):
-                        LOGGER.error(f"FFmpeg split failed or file missing: {stderr}")
-                        await self._cleanup_files(o_files)
-                        return [], []
-
-                    part_size = await get_path_size(output_file)
-                    if part_size > TARGET_SIZE:
-                        high = mid
-                    else:
-                        low = mid
-                    await clean_target(output_file)
-                    if high - low < 1:  # Precision within 1s
-                        break
-
-                # Final split with adjusted duration
-                part_duration = low
                 cmd_ffmpeg = [
                     'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
                     '-c', 'copy', '-map', '0', output_file, '-y'
                 ]
                 LOGGER.info(f"Running FFmpeg: {' '.join(cmd_ffmpeg)}")
                 _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-                if rcode != 0 or not await aiopath.exists(output_file):
-                    LOGGER.error(f"FFmpeg split failed or file missing: {stderr}")
+                if rcode != 0:
+                    LOGGER.error(f"FFmpeg split failed: {stderr}")
+                    await self._cleanup_files(o_files)
+                    return [], []
+
+                if not await aiopath.exists(output_file):
+                    LOGGER.error(f"Part {output_file} not created - possible corruption")
                     await self._cleanup_files(o_files)
                     return [], []
 
                 part_size = await get_path_size(output_file)
                 if part_size > TELEGRAM_LIMIT:
-                    LOGGER.error(f"Part {output_file} size {part_size} still exceeds {TELEGRAM_LIMIT}")
-                    await self._cleanup_files(o_files)
-                    return [], []
+                    LOGGER.warning(f"Part {output_file} size {part_size} exceeds {TELEGRAM_LIMIT}, adjusting")
+                    # Adjust duration down and retry
+                    part_duration *= (TARGET_SIZE / part_size)
+                    await clean_target(output_file)
+                    cmd_ffmpeg[5] = str(part_duration)  # Update -t
+                    LOGGER.info(f"Retrying FFmpeg: {' '.join(cmd_ffmpeg)}")
+                    _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
+                    if rcode != 0 or not await aiopath.exists(output_file):
+                        LOGGER.error(f"Retry failed: {stderr}")
+                        await self._cleanup_files(o_files)
+                        return [], []
+                    part_size = await get_path_size(output_file)
 
                 o_files.append(output_file)
                 m_size.append(part_size)

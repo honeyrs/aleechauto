@@ -117,7 +117,7 @@ class TaskListener(TaskConfig):
 
         o_files, m_size = [], []
         if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
-            LOGGER.info(f"Splitting file {self.name} (size: {size}) into 2 GB parts")
+            LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts under 2 GB")
             o_files, m_size = await self._split_file(up_path)
             if not o_files:
                 await self.onUploadError(f"Failed to split {self.name} into parts.")
@@ -163,6 +163,8 @@ class TaskListener(TaskConfig):
 
     async def _split_file(self, file_path):
         TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
+        TARGET_SIZES = [2040109466, 1992294400, 1887436800]  # 1.95 GB, 1.9 GB, 1.8 GB
+
         try:
             file_size = await get_path_size(file_path)
             if file_size <= TELEGRAM_LIMIT:
@@ -171,53 +173,89 @@ class TaskListener(TaskConfig):
 
             base_name = ospath.splitext(ospath.basename(file_path))[0]
             output_dir = ospath.dirname(file_path)
-            num_parts = (file_size + TELEGRAM_LIMIT - 1) // TELEGRAM_LIMIT
-
-            LOGGER.info(f"Splitting {file_path} (size: {file_size}) into {num_parts} parts with FFmpeg")
-
             duration = (await get_media_info(file_path))[0]
             if not duration:
                 LOGGER.warning(f"Could not get duration for {file_path}, using fallback")
-                duration = file_size / 1000000  # Rough estimate
-            segment_time = duration / num_parts
-            segment_times = [str(round(segment_time * i, 2)) for i in range(1, num_parts)]
-
-            output_pattern = ospath.join(output_dir, f"{base_name}_part%03d.mkv")
-            cmd_ffmpeg = [
-                'ffmpeg', '-i', file_path, '-c', 'copy', '-map', '0',
-                '-f', 'segment', '-segment_times', ','.join(segment_times),
-                '-reset_timestamps', '1', output_pattern, '-y'
-            ]
-            LOGGER.info(f"Running FFmpeg split: {' '.join(cmd_ffmpeg)}")
-            _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
-            if rcode != 0:
-                LOGGER.error(f"FFmpeg split failed: {stderr}")
-                return [], []
+                duration = file_size / 1000000  # Rough estimate in seconds
 
             o_files, m_size = [], []
-            for i in range(num_parts):
-                part_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
-                if await aiopath.exists(part_file):
-                    part_size = await get_path_size(part_file)
-                    if part_size > TELEGRAM_LIMIT:
-                        LOGGER.error(f"Part {part_file} size {part_size} exceeds {TELEGRAM_LIMIT}")
-                        await self._cleanup_files(o_files + [part_file])
+            for attempt, target_size in enumerate(TARGET_SIZES):
+                num_parts = (file_size + target_size - 1) // target_size  # ceil division
+                segment_time = duration / num_parts
+                LOGGER.info(f"Attempt {attempt + 1}: Splitting {file_path} (size: {file_size}) into {num_parts} parts of ~{segment_time:.2f}s each, targeting {target_size} bytes")
+
+                temp_files = []
+                for i in range(num_parts):
+                    start_time = i * segment_time
+                    remaining_time = duration - start_time
+                    part_duration = min(segment_time, remaining_time)  # Adjust last part
+                    output_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
+                    cmd_ffmpeg = [
+                        'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
+                        '-c', 'copy', '-map', '0', output_file, '-y'
+                    ]
+                    LOGGER.info(f"Running FFmpeg: {' '.join(cmd_ffmpeg)}")
+                    _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
+                    if rcode != 0:
+                        LOGGER.error(f"FFmpeg split failed for part {i}: {stderr}")
+                        await self._cleanup_files(temp_files)
                         return [], []
-                    o_files.append(part_file)
-                    m_size.append(part_size)
-                else:
-                    LOGGER.error(f"Part {part_file} not created")
+
+                    if not await aiopath.exists(output_file):
+                        LOGGER.error(f"Part {output_file} not created - possible corruption")
+                        await self._cleanup_files(temp_files)
+                        return [], []
+                    temp_files.append(output_file)
+
+                # Check sizes
+                o_files = temp_files
+                m_size = [await get_path_size(f) for f in o_files]
+                if any(size > TELEGRAM_LIMIT for size in m_size):
+                    LOGGER.warning(f"Attempt {attempt + 1} failed: Oversized parts {[(f, s) for f, s in zip(o_files, m_size) if s > TELEGRAM_LIMIT]}")
+                    await self._cleanup_files(o_files)
+                    continue  # Retry next target
+                break  # Success - all parts under 2 GB
+            else:
+                # All attempts failed - final fallback with max bitrate
+                LOGGER.warning(f"All target sizes failed, using max bitrate adjustment for {file_path}")
+                max_bitrate = max(size / (duration / num_parts) for size in m_size)  # From last attempt
+                segment_time = TELEGRAM_LIMIT / max_bitrate
+                num_parts = int(duration / segment_time) + 1
+                LOGGER.info(f"Fallback: Splitting into {num_parts} parts with ~{segment_time:.2f}s each")
+
+                o_files = []
+                for i in range(num_parts):
+                    start_time = i * segment_time
+                    remaining_time = duration - start_time
+                    part_duration = min(segment_time, remaining_time)
+                    output_file = ospath.join(output_dir, f"{base_name}_part{i:03d}.mkv")
+                    cmd_ffmpeg = [
+                        'ffmpeg', '-i', file_path, '-ss', str(start_time), '-t', str(part_duration),
+                        '-c', 'copy', '-map', '0', output_file, '-y'
+                    ]
+                    _, stderr, rcode = await cmd_exec(cmd_ffmpeg)
+                    if rcode != 0 or not await aiopath.exists(output_file):
+                        LOGGER.error(f"Fallback split failed for part {i}: {stderr or 'file missing'}")
+                        await self._cleanup_files(o_files)
+                        return [], []
+                    o_files.append(output_file)
+
+                m_size = [await get_path_size(f) for f in o_files]
+                if any(size > TELEGRAM_LIMIT for size in m_size):
+                    LOGGER.error(f"Final fallback failed: Parts still exceed {TELEGRAM_LIMIT}")
                     await self._cleanup_files(o_files)
                     return [], []
 
+            # Verify total size
             total_split_size = sum(m_size)
             if abs(total_split_size - file_size) > 1024 * 1024:  # 1 MB tolerance
                 LOGGER.error(f"Split size mismatch: original={file_size}, split_total={total_split_size}")
                 await self._cleanup_files(o_files)
                 return [], []
 
-            LOGGER.info(f"Split {file_path} into {len(o_files)} parts: {o_files}")
+            LOGGER.info(f"Successfully split {file_path} into {len(o_files)} parts: {o_files}")
             return o_files, m_size
+
         except Exception as e:
             LOGGER.error(f"Error splitting {file_path}: {e}", exc_info=True)
             await self._cleanup_files(o_files if 'o_files' in locals() else [])
@@ -363,13 +401,6 @@ class TgUploader:
 
         is_video, is_audio, is_image = await get_document_type(up_path)
         LOGGER.debug(f"File type for {up_path}: video={is_video}, audio={is_audio}, image={is_image}")
-
-        if is_video and not thumb:
-            duration = (await get_media_info(up_path))[0]
-            thumb = await create_thumbnail(up_path, duration)
-            if not thumb or not await aiopath.exists(thumb):
-                LOGGER.warning(f"Thumbnail creation failed for {up_path}, using None")
-                thumb = None
 
         if self._listener.as_doc or (not is_video and not is_audio and not is_image):
             LOGGER.debug(f"Uploading {up_path} as document")

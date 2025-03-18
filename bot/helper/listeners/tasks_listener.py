@@ -179,11 +179,10 @@ class TaskListener(TaskConfig):
 
             await start_from_queued()
 
-            total_size = size  # Use the original file size
-            uploaded_size = 0  # Initialize as 0; will update after upload
+            total_size = size
+            uploaded_size = 0
             LOGGER.info(f"Leeching: {self.name} with total size: {total_size / (1024*1024*1024):.2f} GB, uploaded parts: {uploaded_size / (1024*1024*1024):.2f} GB")
 
-            # Use split_dir if splitting occurred, otherwise up_dir
             upload_path = split_dir if o_files and all(f.endswith('.mkv') for f in o_files) else up_dir
             tg = TgUploader(self, upload_path, size)
             async with task_dict_lock:
@@ -281,7 +280,7 @@ class TaskListener(TaskConfig):
                         LOGGER.debug(f"Creating last part {part_num}: {part_file}")
                     else:
                         low, high = 0, duration - start_time
-                        target_duration = target_max_bytes / bytes_per_sec
+                        target_duration = min(target_max_bytes / bytes_per_sec, (duration - start_time) / (num_parts - part_num + 1))
                         best_duration = target_duration
                         for _ in range(5):
                             if high - low <= 1.0:
@@ -292,6 +291,7 @@ class TaskListener(TaskConfig):
                             try:
                                 await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
                                 temp_size = await get_path_size(temp_file)
+                                LOGGER.debug(f"Test split {temp_file}: {temp_size / (1024*1024*1024):.2f} GB")
                                 await clean_target(temp_file)
                                 if temp_size > target_max_bytes:
                                     high = mid
@@ -310,9 +310,9 @@ class TaskListener(TaskConfig):
                     try:
                         await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
                         part_size = await get_path_size(part_file)
-                        LOGGER.info(f"Created {part_file}: {part_size / (1024*1024*1024):.2f} GB")
+                        LOGGER.info(f"Created {part_file}: {part_size / (1024*1024*1024):.2f} GB (raw bytes: {part_size})")
                         parts_info.append((part_file, start_time, part_size))
-                        o_files.append(ospath.basename(part_file))  # Still use basename, but path is adjusted in upload
+                        o_files.append(ospath.basename(part_file))
                         m_size.append(part_size)
                         if not is_last_part:
                             start_time += best_duration
@@ -321,13 +321,15 @@ class TaskListener(TaskConfig):
                         await self.onUploadError(f"Split failed: {e}")
                         return False
 
-                # Adjust only non-final parts
+                # Adjust only non-final parts if needed
                 for i, (part_file, old_start, part_size) in enumerate(parts_info[:-1]):  # Exclude last part
-                    if not await self._adjust_part_size(input_file, part_file, old_start, part_size, target_min_bytes, target_max_bytes, duration):
-                        LOGGER.warning(f"Adjustment failed for {part_file}, proceeding anyway")
-                    new_size = await get_path_size(part_file)
-                    m_size[i] = new_size
-                    LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB")
+                    if part_size < target_min_bytes or part_size > target_max_bytes:
+                        LOGGER.debug(f"Adjusting {part_file} from {part_size / (1024*1024*1024):.2f} GB")
+                        if not await self._adjust_part_size(input_file, part_file, old_start, part_size, target_min_bytes, target_max_bytes, duration):
+                            LOGGER.warning(f"Adjustment failed for {part_file}, using original split")
+                        new_size = await get_path_size(part_file)
+                        LOGGER.debug(f"Post-adjustment {part_file}: {new_size / (1024*1024*1024):.2f} GB (raw bytes: {new_size})")
+                        m_size[i] = new_size
 
                 await clean_target(input_file)
 
@@ -344,13 +346,14 @@ class TaskListener(TaskConfig):
         max_attempts = 5
 
         for attempt in range(max_attempts):
-            target_duration = (target_max_bytes if current_size_bytes < target_min_bytes else target_min_bytes) / bytes_per_sec
-            new_duration = min(remaining_duration, target_duration * (1 + 0.05 * attempt if current_size_bytes < target_min_bytes else 1 - 0.05 * attempt))
+            target_duration = min(remaining_duration, (target_max_bytes if current_size_bytes < target_min_bytes else target_min_bytes) / bytes_per_sec)
+            adjustment_factor = 1 + 0.05 * attempt if current_size_bytes < target_min_bytes else 1 - 0.05 * attempt
+            new_duration = target_duration * adjustment_factor
             cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(new_duration), '-c', 'copy', part_file]
             try:
                 await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
                 new_size = await get_path_size(part_file)
-                LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB (attempt {attempt + 1})")
+                LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB (raw bytes: {new_size}, attempt {attempt + 1})")
                 if target_min_bytes <= new_size <= target_max_bytes:
                     return True
                 current_size_bytes = new_size

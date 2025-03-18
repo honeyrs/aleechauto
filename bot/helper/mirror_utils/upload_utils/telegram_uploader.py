@@ -54,7 +54,7 @@ class TgUploader:
         await self._user_settings()
         await self._msg_to_reply()
         corrupted_files = total_files = 0
-        for dirpath, _, files in sorted(await sync_to_async(walk, self._path)):
+        for dirpath, _, files in sorted(await sync_to_async(ospath.walk, self._path)):
             if dirpath.endswith('/yt-dlp-thumb'):
                 continue
             for file_ in natsorted(files):
@@ -267,7 +267,7 @@ class TgUploader:
         self._user_caption = self._listener.user_dict.get('captions', False)
         self._user_fnamecap = self._listener.user_dict.get('fnamecap', True)
         if config_dict['AUTO_THUMBNAIL']:
-            for dirpath, _, files in await sync_to_async(walk, self._path):
+            for dirpath, _, files in await sync_to_async(ospath.walk, self._path):
                 for file in files:
                     filepath = ospath.join(dirpath, file)
                     if file.startswith('Thumb') and (await get_document_type(filepath))[-1]:

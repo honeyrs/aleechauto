@@ -145,7 +145,6 @@ class TaskListener(TaskConfig):
             self.seed = False
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
-            # Apply splitting here for vidMode before Telegram upload
             if self.isLeech:
                 o_files, m_size = [], []
                 LOGGER.info(f"Checking split for {self.name} (size: {size / (1024*1024*1024):.2f} GB) MID: {self.mid}")
@@ -263,7 +262,7 @@ class TaskListener(TaskConfig):
         split_dir = ospath.join(up_dir, "splited_files_mltb")
         await makedirs(split_dir, exist_ok=True)
 
-        for dirpath, _, files in await sync_to_async(walk, up_dir):
+        for dirpath, _, files in await sync_to_async(ospath.walk, up_dir):
             for file_ in files:
                 input_file = ospath.join(dirpath, file_)
                 if not await aiopath.exists(input_file) or file_.endswith(('.aria2', '.!qB')):

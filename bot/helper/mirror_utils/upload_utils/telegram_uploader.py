@@ -1,4 +1,3 @@
-from __future__ import annotations
 from aiofiles.os import path as aiopath, rename as aiorename, makedirs
 from aioshutil import copy
 from asyncio import sleep, gather
@@ -11,6 +10,8 @@ from pyrogram.types import InputMediaVideo, InputMediaDocument, InputMediaPhoto,
 from re import match as re_match
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
 from time import time
+import subprocess
+import math
 
 from bot import bot, bot_dict, bot_lock, config_dict, DEFAULT_SPLIT_SIZE, LOGGER
 from bot.helper.ext_utils.bot_utils import sync_to_async, default_button
@@ -42,19 +43,161 @@ class TgUploader:
         self._send_msg = None
         self._up_path = ''
         self._leech_log = config_dict['LEECH_LOG']
+        LOGGER.debug(f"Initialized TgUploader: {self._listener.name}, Path: {self._path}, Size: {self._size}")
 
     async def _upload_progress(self, current, _):
         if self._is_cancelled:
+            LOGGER.info("Upload cancelled, stopping transmission")
             self._client.stop_transmission()
         chunk_size = current - self._last_uploaded
         self._last_uploaded = current
         self._processed_bytes += chunk_size
+        LOGGER.debug(f"Progress: {self._processed_bytes / (1024*1024):.2f} MB for {self._up_path}")
+
+    async def _adjust_part_size(self, input_file, part_file, start_time, current_size_bytes, target_min_bytes, target_max_bytes, total_duration):
+        """Adjust part size if outside 1.95-1.99 GB range."""
+        if target_min_bytes <= current_size_bytes <= target_max_bytes:
+            LOGGER.debug(f"Part {part_file} size {current_size_bytes / (1024*1024*1024):.2f} GB is within range")
+            return True
+
+        remaining_duration = total_duration - start_time
+        shrink_factor = 0.95
+        expansion_factor = 1.05
+        max_attempts = 3
+
+        for attempt in range(max_attempts):
+            if current_size_bytes > target_max_bytes:
+                new_duration = remaining_duration * shrink_factor * (1 - attempt * 0.05)
+                LOGGER.debug(f"Attempt {attempt + 1}: Shrinking {part_file} from {current_size_bytes / (1024*1024*1024):.2f} GB to {new_duration:.2f}s")
+            elif current_size_bytes < target_min_bytes:
+                new_duration = min(remaining_duration * expansion_factor * (1 + attempt * 0.05), remaining_duration)
+                LOGGER.debug(f"Attempt {attempt + 1}: Expanding {part_file} from {current_size_bytes / (1024*1024*1024):.2f} GB to {new_duration:.2f}s")
+            else:
+                return True
+
+            cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(new_duration), '-c', 'copy', part_file]
+            try:
+                await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
+                new_size = await get_path_size(part_file)
+                LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB")
+                if target_min_bytes <= new_size <= target_max_bytes:
+                    return True
+                current_size_bytes = new_size
+            except Exception as e:
+                LOGGER.error(f"Adjustment attempt {attempt + 1} failed for {part_file}: {e}")
+                return False
+
+        LOGGER.warning(f"Failed to adjust {part_file} after {max_attempts} attempts")
+        return False
+
+    async def _split_file(self, input_file):
+        """Split file into parts between 1.95GB and 1.99GB with adjustment."""
+        target_min_bytes = 1.95 * 1024 * 1024 * 1024  # 1.95 GB
+        target_max_bytes = 1.99 * 1024 * 1024 * 1024  # 1.99 GB
+        split_dir = ospath.join(self._path, "splited_files_mltb")
+        await makedirs(split_dir, exist_ok=True)
+        split_files = []
+
+        file_size = await get_path_size(input_file)
+        LOGGER.debug(f"File {input_file}: {file_size / (1024*1024*1024):.2f} GB")
+        if file_size <= target_max_bytes:
+            LOGGER.debug("No split required")
+            return [input_file]
+
+        try:
+            await sync_to_async(subprocess.run, ['ffmpeg', '-version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            await sync_to_async(subprocess.run, ['ffprobe', '-version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError:
+            LOGGER.error("FFmpeg or ffprobe not found")
+            raise Exception("FFmpeg/ffprobe not installed")
+
+        try:
+            cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
+            result = await sync_to_async(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            duration = float(result.stdout.strip())
+            LOGGER.debug(f"Duration: {duration:.2f}s")
+        except (subprocess.CalledProcessError, ValueError) as e:
+            LOGGER.error(f"Duration fetch failed: {e}")
+            raise Exception(f"Cannot get duration: {e}")
+
+        num_parts = max(1, math.ceil(file_size / target_max_bytes))
+        start_time = 0
+        base_name = ospath.splitext(ospath.basename(input_file))[0]
+        parts_info = []  # (part_file, start_time, size)
+        LOGGER.info(f"Splitting {input_file} into {num_parts} parts")
+
+        for part_num in range(1, num_parts + 1):
+            part_file = ospath.join(split_dir, f"{base_name}.part{part_num}.mkv")
+            is_last_part = (part_num == num_parts)
+
+            if is_last_part:
+                cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-c', 'copy', part_file]
+                LOGGER.debug(f"Last part {part_num}: {part_file}")
+            else:
+                low, high = 0, duration - start_time
+                bytes_per_sec = file_size / duration
+                split_duration = target_min_bytes / bytes_per_sec
+                low, high = max(0, split_duration * 0.9), min(high, split_duration * 1.1)
+                best_duration = split_duration
+
+                for _ in range(5):
+                    if high - low <= 5.0:
+                        break
+                    mid = (low + high) / 2
+                    temp_file = ospath.join(split_dir, "temp_split.mkv")
+                    cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(mid), '-c', 'copy', temp_file]
+                    try:
+                        await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
+                        temp_size = await get_path_size(temp_file)
+                        LOGGER.debug(f"Test split: {mid:.2f}s, {temp_size / (1024*1024*1024):.2f} GB")
+                        await clean_target(temp_file)
+                        if temp_size > target_max_bytes:
+                            high = mid
+                        elif temp_size < target_min_bytes:
+                            low = mid
+                        else:
+                            best_duration = mid
+                            break
+                        best_duration = mid
+                    except Exception as e:
+                        LOGGER.error(f"Test split failed: {e}")
+                        if await aiopath.exists(temp_file):
+                            await clean_target(temp_file)
+                        raise Exception(f"Split test failed: {e}")
+
+                cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(best_duration), '-c', 'copy', part_file]
+                LOGGER.debug(f"Part {part_num}: {part_file}, duration {best_duration:.2f}s")
+
+            try:
+                await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
+                part_size = await get_path_size(part_file)
+                parts_info.append((part_file, start_time, part_size))
+                split_files.append(part_file)
+                LOGGER.info(f"Created {part_file}: {part_size / (1024*1024*1024):.2f} GB")
+                if not is_last_part:
+                    start_time += best_duration
+            except Exception as e:
+                LOGGER.error(f"Split failed for {part_file}: {e}")
+                raise Exception(f"Split failed: {e}")
+
+        adjusted_start_time = 0
+        for i, (part_file, old_start, part_size) in enumerate(parts_info):
+            if not await self._adjust_part_size(input_file, part_file, adjusted_start_time, part_size, target_min_bytes, target_max_bytes, duration):
+                LOGGER.warning(f"Adjustment failed for {part_file}")
+            new_size = await get_path_size(part_file)
+            LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB")
+            adjusted_start_time = old_start + (new_size / (file_size / duration)) if i < num_parts - 1 else duration
+
+        await clean_target(input_file)
+        return split_files
 
     async def upload(self, o_files, m_size):
         await self._user_settings()
         await self._msg_to_reply()
         corrupted_files = total_files = 0
-        for dirpath, _, files in sorted(await sync_to_async(ospath.walk, self._path)):
+        LOGGER.info(f"Starting upload for {self._listener.name}")
+
+        for dirpath, _, files in sorted(await sync_to_async(walk, self._path)):
             if dirpath.endswith('/yt-dlp-thumb'):
                 continue
             for file_ in natsorted(files):
@@ -65,49 +208,46 @@ class TgUploader:
                     continue
                 try:
                     f_size = await get_path_size(self._up_path)
-                    if f_size > 1.99 * 1024 * 1024 * 1024:
-                        LOGGER.error(f"File {self._up_path} exceeds 1.99GB: {f_size / (1024*1024*1024):.2f} GB")
+                    LOGGER.debug(f"Processing {self._up_path}: {f_size / (1024*1024*1024):.2f} GB")
+                    if f_size == 0:
                         corrupted_files += 1
+                        LOGGER.error(f"Zero size file: {self._up_path}")
                         continue
                     if self._listener.seed and file_ in o_files and f_size in m_size:
                         continue
-                    if f_size == 0:
-                        corrupted_files += 1
-                        LOGGER.error(f"{self._up_path} size is zero, telegram don't upload zero size files")
-                        continue
                     if self._is_cancelled:
                         return
-                    caption = await self._prepare_file(file_, dirpath)
-                    if self._last_msg_in_group:
-                        group_lists = [x for v in self._media_dict.values() for x in v.keys()]
-                        match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path)
-                        if not match or match and match.group(0) not in group_lists:
-                            for key, value in list(self._media_dict.items()):
-                                for subkey, msgs in list(value.items()):
-                                    if len(msgs) > 1:
-                                        await self._send_media_group(msgs, subkey, key)
-                    self._last_msg_in_group = False
-                    self._last_uploaded = 0
-                    await self._upload_file(caption, file_)
-                    total_files += 1
-                    if self._is_cancelled:
-                        return
-                    if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
-                        self._msgs_dict[self._send_msg.link] = file_
-                    await sleep(3)
+
+                    files_to_upload = await self._split_file(self._up_path) if f_size > 1.99 * 1024 * 1024 * 1024 else [self._up_path]
+                    for up_path in files_to_upload:
+                        self._up_path = up_path
+                        caption = await self._prepare_file(ospath.basename(self._up_path), ospath.dirname(self._up_path))
+                        if self._last_msg_in_group:
+                            group_lists = [x for v in self._media_dict.values() for x in v.keys()]
+                            match = re_match(r'.+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)', self._up_path)
+                            if not match or match.group(0) not in group_lists:
+                                for key, value in list(self._media_dict.items()):
+                                    for subkey, msgs in list(value.items()):
+                                        if len(msgs) > 1:
+                                            await self._send_media_group(msgs, subkey, key)
+                        self._last_msg_in_group = False
+                        self._last_uploaded = 0
+                        await self._upload_file(caption, ospath.basename(self._up_path))
+                        total_files += 1
+                        if not self._is_corrupted and (self._listener.isSuperChat or self._leech_log):
+                            self._msgs_dict[self._send_msg.link] = ospath.basename(self._up_path)
+                        await sleep(3)
                 except Exception as err:
                     if isinstance(err, RetryError):
-                        LOGGER.info(f'Total Attempts: {err.last_attempt.attempt_number}', exc_info=True)
                         corrupted_files += 1
                         self._is_corrupted = True
                         err = err.last_attempt.exception()
-                    LOGGER.error(f'{err}. Path: {self._up_path}')
+                    LOGGER.error(f"Error: {err}", exc_info=True)
                     corrupted_files += 1
-                    if self._is_cancelled:
-                        return
                     continue
                 finally:
-                    if not self._is_cancelled and await aiopath.exists(self._up_path) and (not self._listener.seed or self._listener.newDir or
+                    if not self._is_cancelled and await aiopath.exists(self._up_path) and (
+                        not self._listener.seed or self._listener.newDir or
                         dirpath.endswith('/splited_files_mltb') or '/copied_mltb/' in self._up_path):
                         await clean_target(self._up_path)
 
@@ -125,7 +265,7 @@ class TgUploader:
         if total_files <= corrupted_files:
             await self._listener.onUploadError('Files Corrupted or unable to upload. Check logs!')
             return
-        LOGGER.info(f'Leech Completed: {self._listener.name}')
+        LOGGER.info(f"Leech completed: {self._listener.name}")
         await self._listener.onUploadComplete(None, self._size, self._msgs_dict, total_files, corrupted_files)
 
     @retry(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(4), retry=retry_if_exception_type(Exception))
@@ -157,15 +297,13 @@ class TgUploader:
 
             if self._listener.as_doc or force_document or (not is_video and not is_audio and not is_image):
                 key = 'documents'
-                if self._is_cancelled:
-                    return
                 self._send_msg = await self._client.send_document(chat_id=self._send_msg.chat.id,
-                                                                  document=self._up_path,
-                                                                  thumb=thumb,
-                                                                  caption=caption,
-                                                                  disable_notification=True,
-                                                                  progress=self._upload_progress,
-                                                                  reply_to_message_id=self._send_msg.id)
+                                                                 document=self._up_path,
+                                                                 thumb=thumb,
+                                                                 caption=caption,
+                                                                 disable_notification=True,
+                                                                 progress=self._upload_progress,
+                                                                 reply_to_message_id=self._send_msg.id)
             elif is_video:
                 key = 'videos'
                 if thumb:
@@ -184,48 +322,39 @@ class TgUploader:
                         new_path = f'{ospath.splitext(self._up_path)[0]}.mp4'
                         await aiorename(self._up_path, new_path)
                         self._up_path = new_path
-                if self._is_cancelled:
-                    return
                 self._send_msg = await self._client.send_video(chat_id=self._send_msg.chat.id,
-                                                               video=self._up_path,
-                                                               caption=caption,
-                                                               duration=duration,
-                                                               width=width,
-                                                               height=height,
-                                                               thumb=thumb,
-                                                               supports_streaming=True,
-                                                               disable_notification=True,
-                                                               progress=self._upload_progress,
-                                                               reply_to_message_id=self._send_msg.id)
+                                                              video=self._up_path,
+                                                              caption=caption,
+                                                              duration=duration,
+                                                              width=width,
+                                                              height=height,
+                                                              thumb=thumb,
+                                                              supports_streaming=True,
+                                                              disable_notification=True,
+                                                              progress=self._upload_progress,
+                                                              reply_to_message_id=self._send_msg.id)
             elif is_audio:
                 key = 'audios'
                 duration, artist, title = await get_media_info(self._up_path)
-                if self._is_cancelled:
-                    return
                 self._send_msg = await self._client.send_audio(chat_id=self._send_msg.chat.id,
-                                                               audio=self._up_path,
-                                                               caption=caption,
-                                                               duration=duration,
-                                                               performer=artist,
-                                                               title=title,
-                                                               thumb=thumb,
-                                                               disable_notification=True,
-                                                               progress=self._upload_progress,
-                                                               reply_to_message_id=self._send_msg.id)
+                                                              audio=self._up_path,
+                                                              caption=caption,
+                                                              duration=duration,
+                                                              performer=artist,
+                                                              title=title,
+                                                              thumb=thumb,
+                                                              disable_notification=True,
+                                                              progress=self._upload_progress,
+                                                              reply_to_message_id=self._send_msg.id)
             else:
                 key = 'photos'
-                if self._is_cancelled:
-                    return
                 self._send_msg = await bot.send_photo(chat_id=self._send_msg.chat.id,
-                                                      photo=self._up_path,
-                                                      caption=caption,
-                                                      disable_notification=True,
-                                                      progress=self._upload_progress,
-                                                      reply_to_message_id=self._send_msg.id)
-            if self._is_cancelled:
-                return
+                                                     photo=self._up_path,
+                                                     caption=caption,
+                                                     disable_notification=True,
+                                                     progress=self._upload_progress,
+                                                     reply_to_message_id=self._send_msg.id)
             await self._final_message(ss_image, bool(is_video or is_audio))
-            
             await self._copy_Leech(self._listener.user_id, self._send_msg)
             if self._listener.upDest:
                 await self._copy_Leech(self._listener.upDest, self._send_msg)
@@ -243,18 +372,16 @@ class TgUploader:
                     else:
                         self._last_msg_in_group = True
 
-            if not self._thumb and thumb:
+            if not self._thumb and thumb and await aiopath.exists(thumb):
                 await clean_target(thumb)
         except FloodWait as f:
-            LOGGER.warning(f, exc_info=True)
+            LOGGER.warning(f"Flood wait: {f.value}s")
             await sleep(f.value * 1.2)
         except Exception as err:
-            if not self._thumb and thumb:
+            if not self._thumb and thumb and await aiopath.exists(thumb):
                 await clean_target(thumb)
-            err_type = 'RPCError: ' if isinstance(err, RPCError) else ''
-            LOGGER.error(f'{err_type}{err}. Path: {self._up_path}')
-            if 'Telegram says: [400' in str(err) and key != 'documents':
-                LOGGER.error(f'Retrying As Document. Path: {self._up_path}', exc_info=True)
+            if isinstance(err, RPCError) and 'Telegram says: [400' in str(err) and key != 'documents':
+                LOGGER.error(f"Retrying as document: {err}")
                 return await self._upload_file(caption, file, True)
             raise err
 
@@ -267,7 +394,7 @@ class TgUploader:
         self._user_caption = self._listener.user_dict.get('captions', False)
         self._user_fnamecap = self._listener.user_dict.get('fnamecap', True)
         if config_dict['AUTO_THUMBNAIL']:
-            for dirpath, _, files in await sync_to_async(ospath.walk, self._path):
+            for dirpath, _, files in await sync_to_async(walk, self._path):
                 for file in files:
                     filepath = ospath.join(dirpath, file)
                     if file.startswith('Thumb') and (await get_document_type(filepath))[-1]:
@@ -278,7 +405,7 @@ class TgUploader:
     def speed(self):
         try:
             return self._processed_bytes / (time() - self._start_time)
-        except:
+        except ZeroDivisionError:
             return 0
 
     @property
@@ -287,7 +414,7 @@ class TgUploader:
 
     async def cancel_task(self):
         self._is_cancelled = True
-        LOGGER.info(f'Cancelling Upload: {self._listener.name}')
+        LOGGER.info(f"Cancelling upload: {self._listener.name}")
         await self._listener.onUploadError('Upload stopped by user!')
 
     async def _prepare_file(self, file_, dirpath):
@@ -331,25 +458,23 @@ class TgUploader:
 
     async def _gen_ss(self, vid_path):
         if not self._enable_ss or self._is_cancelled:
-            return
+            return None
         ss = GenSS(self._listener.message, vid_path)
         await ss.file_ss()
-        if ss.error:
-            return
-        return ss.rimage
+        return ss.rimage if not ss.error else None
 
     @handle_message
     async def _msg_to_reply(self):
         if self._leech_log and self._leech_log != self._listener.message.chat.id:
             caption = f'<b>▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n{self._listener.name}\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬</b>'
             if self._thumb and await aiopath.exists(self._thumb):
-                self._send_msg: Message = await bot.send_photo(self._leech_log, photo=self._thumb, caption=caption)
+                self._send_msg = await bot.send_photo(self._leech_log, photo=self._thumb, caption=caption)
             else:
-                self._send_msg: Message = await bot.send_message(self._leech_log, caption, disable_web_page_preview=True)
+                self._send_msg = await bot.send_message(self._leech_log, caption, disable_web_page_preview=True)
             if config_dict['LEECH_INFO_PIN']:
                 await self._send_msg.pin(both_sides=True)
         else:
-            self._send_msg: Message = await bot.get_messages(self._listener.message.chat.id, self._listener.mid)
+            self._send_msg = await bot.get_messages(self._listener.message.chat.id, self._listener.mid)
             if not self._send_msg or not self._send_msg.chat:
                 self._send_msg = self._listener.message
         if self._send_msg and self._log_title and self._listener.upDest:
@@ -358,7 +483,7 @@ class TgUploader:
     @handle_message
     async def _send_media_group(self, msgs: list[Message], subkey: str, key: str):
         msgs_list = await msgs[0].reply_to_message.reply_media_group(media=self._get_input_media(subkey, key),
-                                                                     quote=True, disable_notification=True)
+                                                                    quote=True, disable_notification=True)
         await self._copy_media_group(self._listener.user_id, msgs_list)
         if self._listener.upDest:
             await self._copy_media_group(self._listener.upDest, msgs_list)

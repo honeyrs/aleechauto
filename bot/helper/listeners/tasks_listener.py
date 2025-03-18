@@ -2,7 +2,7 @@ from aiofiles.os import listdir, path as aiopath, makedirs
 from aioshutil import move
 from asyncio import sleep, gather, wait_for, TimeoutError as AsyncTimeoutError
 from html import escape
-from os import path as ospath
+from os import walk, path as ospath
 from random import choice
 from requests import utils as rutils
 from time import time
@@ -44,17 +44,20 @@ class TaskListener(TaskConfig):
                     intvl.cancel()
             Intervals['status'].clear()
             await gather(sync_to_async(aria2.purge), delete_status())
-        except:
-            pass
+            LOGGER.debug("Cleaned status intervals and aria2")
+        except Exception as e:
+            LOGGER.error(f"Error during cleanup: {e}")
 
     def removeFromSameDir(self):
         if self.sameDir and self.mid in self.sameDir['tasks']:
             self.sameDir['tasks'].remove(self.mid)
             self.sameDir['total'] -= 1
+            LOGGER.debug(f"Removed {self.mid} from sameDir, remaining: {self.sameDir['total']}")
 
     async def onDownloadStart(self):
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
+            LOGGER.debug(f"Added incomplete task: {self.message.link}")
 
     async def onDownloadComplete(self):
         multi_links = False
@@ -91,11 +94,11 @@ class TaskListener(TaskConfig):
         if not await aiopath.exists(up_path):
             try:
                 files = await listdir(self.dir)
-                self.name = files[-1]
-                if self.name == 'yt-dlp-thumb':
-                    self.name = files[0]
+                self.name = files[-1] if files[-1] != 'yt-dlp-thumb' else files[0]
+                up_path = ospath.join(self.dir, self.name)
+                LOGGER.debug(f"Adjusted path to: {up_path}")
             except Exception as e:
-                await self.onUploadError(str(e))
+                await self.onUploadError(f"Cannot find file: {e}")
                 return
 
         await self.isOneFile(up_path)
@@ -138,42 +141,13 @@ class TaskListener(TaskConfig):
                 return
 
         if not self.compress and self.vidMode:
-            LOGGER.info(f"Processing video with VidEcxecutor for MID: {self.mid}")
+            LOGGER.info(f"Processing video with VidEcxecutor: {self.name}")
             up_path = await VidEcxecutor(self, up_path, gid).execute()
             if not up_path:
                 return
             self.seed = False
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
-            if self.isLeech:
-                o_files, m_size = [], []
-                LOGGER.info(f"Checking split for {self.name} (size: {size / (1024*1024*1024):.2f} GB) MID: {self.mid}")
-                result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
-                if not result:
-                    return
-                LOGGER.info(f"Proceeding to Telegram upload for MID: {self.mid} with o_files: {o_files}")
-                tg = TgUploader(self, up_dir, size)
-                async with task_dict_lock:
-                    task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
-                try:
-                    await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
-                    LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
-                except AsyncTimeoutError:
-                    LOGGER.error(f"Upload timeout for MID: {self.mid}")
-                    await self.onUploadError("Upload timed out after 10 minutes.")
-                    return
-                except Exception as e:
-                    LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
-                    await self.onUploadError(f"Upload failed: {str(e)}")
-                    return
-                await clean_download(self.dir)
-                async with task_dict_lock:
-                    task_dict.pop(self.mid, None)
-                async with queue_dict_lock:
-                    if self.mid in non_queued_up:
-                        non_queued_up.remove(self.mid)
-                await start_from_queued()
-                return
 
         if one_path := await self.isOneFile(up_path):
             up_path = one_path
@@ -183,27 +157,26 @@ class TaskListener(TaskConfig):
 
         if self.isLeech:
             o_files, m_size = [], []
-            if not self.compress:
-                result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
-                if not result:
-                    return
-            LOGGER.info(f"Leeching with o_files: {o_files}, m_size: {m_size} for MID: {self.mid}")
+            LOGGER.info(f"Checking split for {self.name}, size: {size / (1024*1024*1024):.2f} GB")
+            result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
+            if not result:
+                return
 
             add_to_queue, event = await check_running_tasks(self.mid, "up")
             if add_to_queue:
-                LOGGER.info(f"Added to Queue/Upload: {self.name} (MID: {self.mid})")
+                LOGGER.info(f"Added to upload queue: {self.name}")
                 async with task_dict_lock:
                     task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
                 try:
                     await wait_for(event.wait(), timeout=300)
                 except AsyncTimeoutError:
-                    LOGGER.error(f"Queue timeout for MID: {self.mid}")
                     await self.onUploadError("Upload queue timeout.")
                     return
                 async with task_dict_lock:
                     if self.mid not in task_dict:
                         return
-                LOGGER.info(f"Start from Queued/Upload: {self.name} (MID: {self.mid})")
+                LOGGER.info(f"Starting from queue: {self.name}")
+
             async with queue_dict_lock:
                 non_queued_up.add(self.mid)
 
@@ -212,23 +185,22 @@ class TaskListener(TaskConfig):
             size = await get_path_size(up_dir)
             for s in m_size:
                 size -= s
-            LOGGER.info(f"Leech Name: {self.name} (MID: {self.mid})")
+            LOGGER.info(f"Leeching: {self.name} with size: {size / (1024*1024*1024):.2f} GB")
+
             tg = TgUploader(self, up_dir, size)
             async with task_dict_lock:
                 task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
             try:
                 await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
-                LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
+                LOGGER.info(f"Leech completed: {self.name}")
             except AsyncTimeoutError:
-                LOGGER.error(f"Upload timeout for MID: {self.mid}")
                 await self.onUploadError("Upload timed out after 10 minutes.")
                 return
             except Exception as e:
-                LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
                 await self.onUploadError(f"Upload failed: {str(e)}")
                 return
         elif not self.isLeech and self.isGofile:
-            LOGGER.info(f"GoFile Uploading: {self.name} (MID: {self.mid})")
+            LOGGER.info(f"GoFile upload: {self.name}")
             go = GoFileUploader(self)
             async with task_dict_lock:
                 task_dict[self.mid] = GofileUploadStatus(self, go, size, gid)
@@ -236,25 +208,35 @@ class TaskListener(TaskConfig):
             if go.is_cancelled:
                 return
         elif is_gdrive_id(self.upDest):
-            LOGGER.info(f"GDrive Uploading: {self.name} (MID: {self.mid})")
+            LOGGER.info(f"GDrive upload: {self.name}")
             drive = gdUpload(self, up_path)
             async with task_dict_lock:
                 task_dict[self.mid] = GdriveStatus(self, drive, size, gid, 'up')
             await gather(update_status_message(self.message.chat.id), sync_to_async(drive.upload, size))
         elif self.upDest and ':' in self.upDest:
-            LOGGER.info(f"RClone Uploading: {self.name} (MID: {self.mid})")
+            LOGGER.info(f"RClone upload: {self.name}")
             RCTransfer = RcloneTransferHelper(self)
             async with task_dict_lock:
                 task_dict[self.mid] = RcloneStatus(self, RCTransfer, gid, 'up')
             await gather(update_status_message(self.message.chat.id), RCTransfer.upload(up_path, size))
         else:
-            LOGGER.warning(f"No valid upload destination for MID: {self.mid}, assuming upload complete")
+            LOGGER.warning(f"No valid upload destination for {self.name}")
             await self.onUploadComplete(None, size, {}, 0, None)
+
+        await clean_download(self.dir)
+        async with task_dict_lock:
+            task_dict.pop(self.mid, None)
+        async with queue_dict_lock:
+            if self.mid in non_queued_up:
+                non_queued_up.remove(self.mid)
+            if self.mid in non_queued_dl:
+                non_queued_dl.remove(self.mid)
+        await start_from_queued()
 
     async def proceedSplit(self, up_dir, m_size, o_files, size, gid):
         """Split files into parts between 1.95GB and 1.99GB if needed."""
         if not self.isLeech or not await aiopath.isdir(up_dir):
-            LOGGER.info(f"No split needed: isLeech={self.isLeech}, is_dir={await aiopath.isdir(up_dir)}")
+            LOGGER.debug(f"No split needed: isLeech={self.isLeech}, is_dir={await aiopath.isdir(up_dir)}")
             return True
 
         target_min_bytes = 1.95 * 1024 * 1024 * 1024  # 1.95 GB
@@ -262,67 +244,65 @@ class TaskListener(TaskConfig):
         split_dir = ospath.join(up_dir, "splited_files_mltb")
         await makedirs(split_dir, exist_ok=True)
 
-        for dirpath, _, files in await sync_to_async(ospath.walk, up_dir):
+        for dirpath, _, files in await sync_to_async(walk, up_dir):
+            if dirpath.endswith('/splited_files_mltb'):
+                continue
             for file_ in files:
                 input_file = ospath.join(dirpath, file_)
                 if not await aiopath.exists(input_file) or file_.endswith(('.aria2', '.!qB')):
                     continue
 
                 file_size = await get_path_size(input_file)
-                LOGGER.info(f"Checking file {input_file}: {file_size / (1024*1024*1024):.2f} GB")
+                LOGGER.debug(f"Checking {input_file}: {file_size / (1024*1024*1024):.2f} GB")
                 if file_size <= target_max_bytes:
-                    LOGGER.info(f"File {file_} under 1.99GB, no split needed")
+                    LOGGER.debug(f"{file_} under 1.99GB, no split needed")
                     o_files.append(file_)
                     m_size.append(file_size)
                     continue
 
+                # Get duration
                 try:
-                    duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
-                                   '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
-                    duration_result = await sync_to_async(subprocess.run, duration_cmd, 
-                                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                                         text=True, check=True)
-                    duration = float(duration_result.stdout.strip())
-                    LOGGER.info(f"Duration of {file_}: {duration:.2f}s")
+                    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
+                    result = await sync_to_async(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+                    duration = float(result.stdout.strip())
+                    LOGGER.debug(f"Duration of {file_}: {duration:.2f}s")
                 except Exception as e:
                     LOGGER.error(f"Failed to get duration for {input_file}: {e}")
-                    await self.onUploadError(f"Failed to split {file_}: Unable to determine duration")
+                    await self.onUploadError(f"Split failed: Unable to determine duration for {file_}")
                     return False
 
                 num_parts = max(1, math.ceil(file_size / target_max_bytes))
                 start_time = 0
                 base_name = ospath.splitext(file_)[0]
+                parts_info = []  # (part_file, start_time, size)
                 LOGGER.info(f"Splitting {file_} into {num_parts} parts")
 
+                # Initial splitting with binary search
                 for part_num in range(1, num_parts + 1):
-                    is_last_part = (part_num == num_parts)
                     part_file = ospath.join(split_dir, f"{base_name}.part{part_num}.mkv")
+                    is_last_part = (part_num == num_parts)
 
                     if is_last_part:
                         cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-c', 'copy', part_file]
-                        LOGGER.info(f"Creating last part {part_num}/{num_parts}: {part_file}")
+                        LOGGER.debug(f"Creating last part {part_num}: {part_file}")
                     else:
-                        low = 0
-                        high = duration - start_time
-                        bytes_per_second = file_size / duration
-                        split_duration = target_min_bytes / bytes_per_second
+                        low, high = 0, duration - start_time
+                        bytes_per_sec = file_size / duration
+                        split_duration = target_min_bytes / bytes_per_sec
                         low, high = max(0, split_duration * 0.9), min(high, split_duration * 1.1)
                         best_duration = split_duration
-                        iteration = 0
-                        max_iterations = 5
 
-                        while iteration < max_iterations and high - low > 5.0:
+                        for _ in range(5):
+                            if high - low <= 5.0:
+                                break
                             mid = (low + high) / 2
                             temp_file = ospath.join(split_dir, "temp_split.mkv")
-                            cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(mid), 
-                                   '-c', 'copy', temp_file]
+                            cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(mid), '-c', 'copy', temp_file]
                             try:
-                                await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, 
-                                                   check=True, timeout=300)
+                                await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
                                 temp_size = await get_path_size(temp_file)
-                                LOGGER.info(f"Test split: {mid:.2f}s, size: {temp_size / (1024*1024*1024):.2f} GB")
+                                LOGGER.debug(f"Test split: {mid:.2f}s, {temp_size / (1024*1024*1024):.2f} GB")
                                 await clean_target(temp_file)
-
                                 if temp_size > target_max_bytes:
                                     high = mid
                                 elif temp_size < target_min_bytes:
@@ -330,57 +310,97 @@ class TaskListener(TaskConfig):
                                 else:
                                     best_duration = mid
                                     break
-
                                 best_duration = mid
-                                iteration += 1
                             except Exception as e:
-                                LOGGER.error(f"Error testing split for {input_file}: {e}")
+                                LOGGER.error(f"Test split failed for {part_file}: {e}")
                                 if await aiopath.exists(temp_file):
                                     await clean_target(temp_file)
-                                await self.onUploadError(f"Split failed for {file_}")
+                                await self.onUploadError(f"Split failed for {file_}: {e}")
                                 return False
 
-                        cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(best_duration), 
-                               '-c', 'copy', part_file]
-                        LOGGER.info(f"Creating part {part_num}/{num_parts}: {part_file} ({best_duration:.2f}s)")
-                        start_time += best_duration
+                        cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(best_duration), '-c', 'copy', part_file]
+                        LOGGER.debug(f"Creating part {part_num}: {part_file}, duration {best_duration:.2f}s")
 
                     try:
                         await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
                         part_size = await get_path_size(part_file)
-                        LOGGER.info(f"Part {part_num} size: {part_size / (1024*1024*1024):.2f} GB")
+                        parts_info.append((part_file, start_time, part_size))
                         o_files.append(ospath.basename(part_file))
                         m_size.append(part_size)
-                    except subprocess.TimeoutExpired:
-                        LOGGER.error(f"FFmpeg timed out splitting {input_file}")
-                        await self.onUploadError(f"Split timeout for {file_}")
+                        LOGGER.info(f"Created {part_file}: {part_size / (1024*1024*1024):.2f} GB")
+                        if not is_last_part:
+                            start_time += best_duration
+                    except Exception as e:
+                        LOGGER.error(f"Split failed for {part_file}: {e}")
+                        await self.onUploadError(f"Split failed for {file_}: {e}")
                         return False
-                    except subprocess.CalledProcessError as e:
-                        LOGGER.error(f"FFmpeg error splitting {input_file}: {e.stderr}")
-                        await self.onUploadError(f"Split failed for {file_}: {e.stderr}")
-                        return False
+
+                # Post-split adjustment
+                adjusted_start_time = 0
+                for i, (part_file, old_start, part_size) in enumerate(parts_info):
+                    if not await self._adjust_part_size(input_file, part_file, adjusted_start_time, part_size, target_min_bytes, target_max_bytes, duration):
+                        LOGGER.warning(f"Adjustment failed for {part_file}")
+                    new_size = await get_path_size(part_file)
+                    m_size[o_files.index(ospath.basename(part_file))] = new_size  # Update size in m_size
+                    LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB")
+                    adjusted_start_time = old_start + (new_size / (file_size / duration)) if i < num_parts - 1 else duration
 
                 await clean_target(input_file)
 
+        LOGGER.info(f"Split completed for directory {up_dir}")
         return True
+
+    async def _adjust_part_size(self, input_file, part_file, start_time, current_size_bytes, target_min_bytes, target_max_bytes, total_duration):
+        """Adjust part size if outside target range."""
+        if target_min_bytes <= current_size_bytes <= target_max_bytes:
+            LOGGER.debug(f"Part {part_file} size {current_size_bytes / (1024*1024*1024):.2f} GB is within range")
+            return True
+
+        remaining_duration = total_duration - start_time
+        shrink_factor = 0.95
+        expansion_factor = 1.05
+        max_attempts = 3
+
+        for attempt in range(max_attempts):
+            if current_size_bytes > target_max_bytes:
+                new_duration = remaining_duration * shrink_factor * (1 - attempt * 0.05)
+                LOGGER.debug(f"Attempt {attempt + 1}: Shrinking {part_file} from {current_size_bytes / (1024*1024*1024):.2f} GB to {new_duration:.2f}s")
+            elif current_size_bytes < target_min_bytes:
+                new_duration = min(remaining_duration * expansion_factor * (1 + attempt * 0.05), remaining_duration)
+                LOGGER.debug(f"Attempt {attempt + 1}: Expanding {part_file} from {current_size_bytes / (1024*1024*1024):.2f} GB to {new_duration:.2f}s")
+            else:
+                return True
+
+            cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(new_duration), '-c', 'copy', part_file]
+            try:
+                await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
+                new_size = await get_path_size(part_file)
+                LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB")
+                if target_min_bytes <= new_size <= target_max_bytes:
+                    return True
+                current_size_bytes = new_size
+            except Exception as e:
+                LOGGER.error(f"Adjustment attempt {attempt + 1} failed for {part_file}: {e}")
+                return False
+
+        LOGGER.warning(f"Failed to adjust {part_file} after {max_attempts} attempts")
+        return False
 
     async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
+            LOGGER.debug(f"Removed completed task: {self.message.link}")
 
-        LOGGER.info(f"Task Done: {self.name} (MID: {self.mid})")
+        LOGGER.info(f"Task completed: {self.name} (MID: {self.mid})")
         dt_date, dt_time = get_date_time(self.message)
         buttons = ButtonMaker()
         buttons_scr = ButtonMaker()
-        daily_size = size
         size_str = get_readable_file_size(size)
         reply_to = self.message.reply_to_message
         images = choice(config_dict['IMAGE_COMPLETE'].split())
-        TIME_ZONE_TITLE = config_dict['TIME_ZONE_TITLE']
 
         thumb_path = ospath.join(self.dir, 'thumb.png')
         if not await aiopath.exists(thumb_path):
-            LOGGER.info(f"Thumbnail not found at {thumb_path}, using default")
             thumb_path = None
 
         msg = f'<a href="https://t.me/satyamisme1"><b><i>Bot By satyamisme</b></i></a>\n'
@@ -452,7 +472,7 @@ class TaskListener(TaskConfig):
             bot_loop.create_task(auto_delete_message(self.message, uploadmsg, reply_to, stime=stime))
 
     async def onDownloadError(self, error, listfile=None):
-        LOGGER.error(f"Download error for MID: {self.mid}: {error}")
+        LOGGER.error(f"Download error: {error}")
         async with task_dict_lock:
             task_dict.pop(self.mid, None)
         await self.clean()
@@ -462,7 +482,7 @@ class TaskListener(TaskConfig):
         await gather(start_from_queued(), clean_download(self.dir))
 
     async def onUploadError(self, error):
-        LOGGER.error(f"Upload error for MID: {self.mid}: {error}")
+        LOGGER.error(f"Upload error: {error}")
         async with task_dict_lock:
             task_dict.pop(self.mid, None)
         await self.clean()

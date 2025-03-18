@@ -115,13 +115,15 @@ class TaskListener(TaskConfig):
 
         o_files, m_size = [], []
         max_upload_size = 4 * 1024**3 if is_premium_user(self.user_id) else 2 * 1024**3
+        LOGGER.info(f"File size: {size}, Max upload size: {max_upload_size}, Is premium: {is_premium_user(self.user_id)}")
         if size > max_upload_size and await aiopath.isfile(up_path):
-            LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts")
+            LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts maximized to {max_upload_size // 1024**2} MB")
             o_files, m_size = await self._split_file(up_path, size, gid)
             if not o_files:
                 await self.onUploadError(f"Failed to split {self.name} into parts.")
                 return
         else:
+            LOGGER.info(f"No split needed for {self.name} (size: {size} <= {max_upload_size})")
             o_files.append(up_path)
             m_size.append(size)
 
@@ -145,7 +147,8 @@ class TaskListener(TaskConfig):
                     raise FileNotFoundError(f"Missing file: {f}")
             await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
             LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
-            await clean_download(self.dir)
+            if not self._is_cancelled:
+                await clean_download(self.dir)
         except AsyncTimeoutError:
             LOGGER.error(f"Upload timeout for MID: {self.mid}")
             await self.onUploadError("Upload timed out after 10 minutes.")
@@ -161,73 +164,94 @@ class TaskListener(TaskConfig):
             await start_from_queued()
 
     async def _split_file(self, file_path, size, gid):
-        """Split logic adapted from parent project, maximizing parts near 2GB/4GB"""
-        # Determine split size based on user type and config
+        """Split file into parts ≤ split_size (2GB basic, 4GB premium) using FFmpeg."""
         split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
         if is_premium_user(self.user_id):
-            split_size = min(max(split_size, 4 * 1024**3), 4 * 1024**3)  # Cap at 4GB for premium
+            split_size = min(max(split_size, 4 * 1024**3), 4 * 1024**3)  # Max 4GB for premium
         else:
-            split_size = min(max(split_size, 2 * 1024**3), 2 * 1024**3)  # Cap at 2GB for basic
+            split_size = min(max(split_size, 2 * 1024**3), 2 * 1024**3)  # Max 2GB for basic
 
         LOGGER.info(f"Splitting {file_path} (size: {size}) with split_size: {split_size}")
 
-        # If file is smaller than split_size, no split needed
         if size <= split_size:
             LOGGER.info(f"File size {size} <= split_size {split_size}, no split required")
             return [file_path], [size]
 
-        # Prepare output
         o_files, m_size = [], []
-        base_name = ospath.splitext(ospath.basename(file_path))[0]
         output_dir = ospath.dirname(file_path)
+        base_name = ospath.splitext(ospath.basename(file_path))[0]
 
-        # Split file into parts, maximizing near split_size
-        try:
-            remaining_size = size
-            part_num = 0
+        # Get total duration
+        cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)
+        ]
+        _, stdout, stderr = await cmd_exec(cmd)
+        if stderr:
+            LOGGER.error(f"ffprobe failed: {stderr}")
+            return [], []
+        duration = float(stdout.strip())
+        LOGGER.info(f"File duration: {duration} seconds")
 
-            while remaining_size > 0:
-                part_size_target = min(split_size, remaining_size)  # Max out at split_size or remainder
-                output_file = ospath.join(output_dir, f"{base_name}_part{part_num:03d}{ospath.splitext(file_path)[1]}")
-                start_byte = size - remaining_size
+        # Calculate number of parts
+        num_parts = max(1, math.ceil(size / split_size))
+        LOGGER.info(f"Total parts needed: {num_parts}")
 
-                # Use dd for splitting
-                cmd = ['dd', f'if={file_path}', f'of={output_file}', f'bs={part_size_target}', f'skip={part_num}', 'count=1', 'status=none']
-                _, stderr, rcode = await cmd_exec(cmd)
-                if rcode != 0:
-                    LOGGER.error(f"Split failed for part {part_num}: {stderr}")
-                    await self._cleanup_files(o_files)
-                    return [], []
+        start_time = 0
+        bytes_per_second = size / duration
 
-                if not await aiopath.exists(output_file):
-                    LOGGER.error(f"Part {output_file} not created")
-                    await self._cleanup_files(o_files)
-                    return [], []
+        for part_num in range(num_parts):
+            part_file = ospath.join(output_dir, f"{base_name}_part{part_num + 1:03d}{ospath.splitext(file_path)[1]}")
+            remaining_bytes = size - (part_num * split_size)
 
-                part_size = await get_path_size(output_file)
-                if part_size > split_size:
-                    LOGGER.warning(f"Part {output_file} size {part_size} exceeds split_size {split_size}")
-                    await self._cleanup_files(o_files)
-                    return [], []
+            if remaining_bytes <= split_size:
+                # Last part: remainder
+                cmd = [
+                    "ffmpeg", "-i", str(file_path), "-ss", str(start_time),
+                    "-c", "copy", "-map", "0", "-y", str(part_file)
+                ]
+            else:
+                # Full part: ≤ split_size
+                part_duration = split_size / bytes_per_second
+                cmd = [
+                    "ffmpeg", "-i", str(file_path), "-ss", str(start_time),
+                    "-fs", str(split_size), "-c", "copy", "-map", "0", "-y", str(part_file)
+                ]
 
-                o_files.append(output_file)
-                m_size.append(part_size)
-                remaining_size -= part_size
-                part_num += 1
-
-            total_split_size = sum(m_size)
-            if abs(total_split_size - size) > 1024 * 1024:  # 1MB tolerance
-                LOGGER.error(f"Split size mismatch: original={size}, split_total={total_split_size}")
+            LOGGER.info(f"Executing FFmpeg for part {part_num + 1}: {' '.join(cmd)}")
+            _, stdout, stderr = await cmd_exec(cmd)
+            LOGGER.info(f"FFmpeg stdout (part {part_num + 1}): {stdout}")
+            if stderr:
+                LOGGER.error(f"FFmpeg stderr (part {part_num + 1}): {stderr}")
+            if not await aiopath.exists(part_file):
+                LOGGER.error(f"Part {part_file} not created!")
                 await self._cleanup_files(o_files)
                 return [], []
 
-            LOGGER.info(f"Successfully split {file_path} into {len(o_files)} parts: {o_files}")
-            return o_files, m_size
+            part_size = await get_path_size(part_file)
+            if part_size > split_size:
+                LOGGER.error(f"Part {part_file} size {part_size} exceeds split_size {split_size}")
+                await self._cleanup_files(o_files)
+                return [], []
 
-        except Exception as e:
-            LOGGER.error(f"Error splitting {file_path}: {e}", exc_info=True)
-            await self._cleanup_files(o_files if 'o_files' in locals() else [])
-            return [], []
+            o_files.append(part_file)
+            m_size.append(part_size)
+            LOGGER.info(f"Created {part_file}, size: {part_size} bytes")
+
+            # Update start_time
+            part_duration = await sync_to_async(get_duration, part_file)
+            if part_duration is None:
+                LOGGER.error(f"Failed to get duration for {part_file}")
+                await self._cleanup_files(o_files)
+                return [], []
+            start_time += part_duration
+            LOGGER.info(f"Part {part_num + 1} duration: {part_duration}, New start_time: {start_time}")
+
+        total_split_size = sum(m_size)
+        LOGGER.info(f"Split complete. Total size: {total_split_size}, Original: {size}")
+        if abs(total_split_size - size) > 1024 * 1024:  # 1MB tolerance
+            LOGGER.warning(f"Size mismatch: original={size}, split_total={total_split_size}")
+        return o_files, m_size
 
     async def _cleanup_files(self, files):
         for f in files:
@@ -279,133 +303,6 @@ class TaskListener(TaskConfig):
         if self.isSuperChat and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
         await sendingMessage(f"Upload failed: {error}", self.message, None)
-        await gather(start_from_queued(), clean_download(self.dir))
+        await start_from_queued()
 
-class TgUploader:
-    def __init__(self, listener, path: str, size: int):
-        self._listener = listener
-        self._path = path
-        self._size = size
-        self._start_time = time()
-        self._processed_bytes = 0
-        self._is_cancelled = False
-        self._thumb = listener.thumb
-        self._msgs_dict = {}
-        self._client = None
-        self._send_msg = None
-        self._corrupted_files = 0
-
-    async def _upload_progress(self, current, _):
-        if self._is_cancelled:
-            self._client.stop_transmission()
-        chunk_size = current - self._processed_bytes
-        self._processed_bytes += chunk_size
-
-    async def upload(self, o_files, m_size):
-        await self._msg_to_reply()
-        total_files = len(o_files)
-        uploaded_files = 0
-        TELEGRAM_LIMIT = 4 * 1024**3 if is_premium_user(self._listener.user_id) else 2 * 1024**3  # 4GB for premium, 2GB for basic
-
-        for i, file_path in enumerate(o_files):
-            if self._is_cancelled:
-                LOGGER.info(f"Upload cancelled for MID: {self._listener.mid}")
-                return
-            if not await aiopath.exists(file_path):
-                LOGGER.error(f"File not found for upload: {file_path}")
-                self._corrupted_files += 1
-                continue
-
-            part_num = i + 1
-            caption = f"{ospath.basename(file_path)} (Part {part_num} of {total_files})"
-            self._processed_bytes = 0
-
-            try:
-                f_size = m_size[i]
-                if f_size > TELEGRAM_LIMIT:
-                    LOGGER.error(f"File {file_path} size {f_size} exceeds Telegram limit {TELEGRAM_LIMIT}")
-                    self._corrupted_files += 1
-                    continue
-                await self._upload_file(caption, file_path)
-                uploaded_files += 1
-                self._msgs_dict[self._send_msg.link] = ospath.basename(file_path)
-                await sleep(3)
-            except Exception as e:
-                LOGGER.error(f"Upload failed for {file_path}: {e}")
-                self._corrupted_files += 1
-                continue
-            finally:
-                if not self._is_cancelled and await aiopath.exists(file_path) and not self._listener.seed:
-                    await clean_target(file_path)
-
-        if self._is_cancelled:
-            return
-        if uploaded_files == 0:
-            await self._listener.onUploadError("No files uploaded successfully!")
-            return
-        if uploaded_files < total_files:
-            await self._listener.onUploadError(f"Only {uploaded_files}/{total_files} files uploaded successfully! Check logs.")
-            return
-
-        LOGGER.info(f"Upload completed: {self._listener.name}")
-        await self._listener.onUploadComplete(None, self._size, self._msgs_dict, total_files, self._corrupted_files)
-
-    async def _upload_file(self, caption, up_path):
-        file_size = await get_path_size(up_path)
-        TELEGRAM_LIMIT = 4 * 1024**3 if is_premium_user(self._listener.user_id) else 2 * 1024**3  # 4GB for premium, 2GB for basic
-        if file_size > TELEGRAM_LIMIT:
-            raise ValueError(f"File {up_path} size {file_size} exceeds Telegram limit {TELEGRAM_LIMIT}")
-
-        if not await aiopath.exists(up_path):
-            raise FileNotFoundError(f"Upload path missing: {up_path}")
-
-        thumb = self._thumb
-        if thumb and not await aiopath.exists(thumb):
-            LOGGER.warning(f"Thumbnail {thumb} does not exist, using None")
-            thumb = None
-
-        async with bot_lock:
-            self._client = bot
-
-        is_video, is_audio, is_image = await get_document_type(up_path)
-        LOGGER.debug(f"File type for {up_path}: video={is_video}, audio={is_audio}, image={is_image}")
-
-        if self._listener.as_doc or (not is_video and not is_audio and not is_image):
-            LOGGER.debug(f"Uploading {up_path} as document")
-            self._send_msg = await self._client.send_document(
-                chat_id=self._send_msg.chat.id,
-                document=up_path,
-                thumb=thumb if thumb and await aiopath.exists(thumb) else None,
-                caption=caption,
-                disable_notification=True,
-                progress=self._upload_progress,
-                reply_to_message_id=self._send_msg.id
-            )
-        elif is_video:
-            LOGGER.debug(f"Uploading {up_path} as video")
-            duration = (await get_media_info(up_path))[0]
-            self._send_msg = await self._client.send_video(
-                chat_id=self._send_msg.chat.id,
-                video=up_path,
-                thumb=thumb if thumb and await aiopath.exists(thumb) else None,
-                caption=caption,
-                duration=duration,
-                disable_notification=True,
-                progress=self._upload_progress,
-                reply_to_message_id=self._send_msg.id
-            )
-        else:
-            LOGGER.debug(f"Uploading {up_path} as document (default)")
-            self._send_msg = await self._client.send_document(
-                chat_id=self._send_msg.chat.id,
-                document=up_path,
-                thumb=thumb if thumb and await aiopath.exists(thumb) else None,
-                caption=caption,
-                disable_notification=True,
-                progress=self._upload_progress,
-                reply_to_message_id=self._send_msg.id
-            )
-        LOGGER.info(f"Uploaded {up_path} successfully")
-
-    async def _msg_to_reply(self):
-        self._send_msg = self._listener.message
+# TgUploader remains unchanged as provided

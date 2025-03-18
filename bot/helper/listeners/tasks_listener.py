@@ -44,7 +44,6 @@ class TaskListener(TaskConfig):
                     intvl.cancel()
             Intervals['status'].clear()
             await gather(sync_to_async(aria2.purge), delete_status())
-            LOGGER.debug("Cleaned status intervals and aria2")
         except Exception as e:
             LOGGER.error(f"Error during cleanup: {e}")
 
@@ -52,12 +51,10 @@ class TaskListener(TaskConfig):
         if self.sameDir and self.mid in self.sameDir['tasks']:
             self.sameDir['tasks'].remove(self.mid)
             self.sameDir['total'] -= 1
-            LOGGER.debug(f"Removed {self.mid} from sameDir, remaining: {self.sameDir['total']}")
 
     async def onDownloadStart(self):
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
-            LOGGER.debug(f"Added incomplete task: {self.message.link}")
 
     async def onDownloadComplete(self):
         multi_links = False
@@ -96,7 +93,6 @@ class TaskListener(TaskConfig):
                 files = await listdir(self.dir)
                 self.name = files[-1] if files[-1] != 'yt-dlp-thumb' else files[0]
                 up_path = ospath.join(self.dir, self.name)
-                LOGGER.debug(f"Adjusted path to: {up_path}")
             except Exception as e:
                 await self.onUploadError(f"Cannot find file: {e}")
                 return
@@ -182,10 +178,9 @@ class TaskListener(TaskConfig):
 
             await start_from_queued()
 
-            size = await get_path_size(up_dir)
-            for s in m_size:
-                size -= s
-            LOGGER.info(f"Leeching: {self.name} with size: {size / (1024*1024*1024):.2f} GB")
+            total_size = await get_path_size(up_dir)
+            uploaded_size = sum(m_size)
+            LOGGER.info(f"Leeching: {self.name} with total size: {total_size / (1024*1024*1024):.2f} GB, uploaded parts: {uploaded_size / (1024*1024*1024):.2f} GB")
 
             tg = TgUploader(self, up_dir, size)
             async with task_dict_lock:
@@ -234,7 +229,6 @@ class TaskListener(TaskConfig):
         await start_from_queued()
 
     async def proceedSplit(self, up_dir, m_size, o_files, size, gid):
-        """Split files into parts between 1.95GB and 1.99GB if needed."""
         if not self.isLeech or not await aiopath.isdir(up_dir):
             LOGGER.debug(f"No split needed: isLeech={self.isLeech}, is_dir={await aiopath.isdir(up_dir)}")
             return True
@@ -255,29 +249,26 @@ class TaskListener(TaskConfig):
                 file_size = await get_path_size(input_file)
                 LOGGER.debug(f"Checking {input_file}: {file_size / (1024*1024*1024):.2f} GB")
                 if file_size <= target_max_bytes:
-                    LOGGER.debug(f"{file_} under 1.99GB, no split needed")
                     o_files.append(file_)
                     m_size.append(file_size)
                     continue
 
-                # Get duration
                 try:
                     cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_file]
                     result = await sync_to_async(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
                     duration = float(result.stdout.strip())
-                    LOGGER.debug(f"Duration of {file_}: {duration:.2f}s")
                 except Exception as e:
-                    LOGGER.error(f"Failed to get duration for {input_file}: {e}")
-                    await self.onUploadError(f"Split failed: Unable to determine duration for {file_}")
+                    LOGGER.error(f"Failed to get duration: {e}")
+                    await self.onUploadError(f"Split failed: {e}")
                     return False
 
                 num_parts = max(1, math.ceil(file_size / target_max_bytes))
-                start_time = 0
+                bytes_per_sec = file_size / duration
                 base_name = ospath.splitext(file_)[0]
-                parts_info = []  # (part_file, start_time, size)
+                parts_info = []
+                start_time = 0
                 LOGGER.info(f"Splitting {file_} into {num_parts} parts")
 
-                # Initial splitting with binary search
                 for part_num in range(1, num_parts + 1):
                     part_file = ospath.join(split_dir, f"{base_name}.part{part_num}.mkv")
                     is_last_part = (part_num == num_parts)
@@ -287,13 +278,10 @@ class TaskListener(TaskConfig):
                         LOGGER.debug(f"Creating last part {part_num}: {part_file}")
                     else:
                         low, high = 0, duration - start_time
-                        bytes_per_sec = file_size / duration
-                        split_duration = target_min_bytes / bytes_per_sec
-                        low, high = max(0, split_duration * 0.9), min(high, split_duration * 1.1)
-                        best_duration = split_duration
-
+                        target_duration = target_max_bytes / bytes_per_sec
+                        best_duration = target_duration
                         for _ in range(5):
-                            if high - low <= 5.0:
+                            if high - low <= 1.0:
                                 break
                             mid = (low + high) / 2
                             temp_file = ospath.join(split_dir, "temp_split.mkv")
@@ -301,7 +289,6 @@ class TaskListener(TaskConfig):
                             try:
                                 await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
                                 temp_size = await get_path_size(temp_file)
-                                LOGGER.debug(f"Test split: {mid:.2f}s, {temp_size / (1024*1024*1024):.2f} GB")
                                 await clean_target(temp_file)
                                 if temp_size > target_max_bytes:
                                     high = mid
@@ -312,38 +299,32 @@ class TaskListener(TaskConfig):
                                     break
                                 best_duration = mid
                             except Exception as e:
-                                LOGGER.error(f"Test split failed for {part_file}: {e}")
-                                if await aiopath.exists(temp_file):
-                                    await clean_target(temp_file)
-                                await self.onUploadError(f"Split failed for {file_}: {e}")
+                                LOGGER.error(f"Test split failed: {e}")
+                                await self.onUploadError(f"Split failed: {e}")
                                 return False
-
                         cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(best_duration), '-c', 'copy', part_file]
-                        LOGGER.debug(f"Creating part {part_num}: {part_file}, duration {best_duration:.2f}s")
 
                     try:
                         await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
                         part_size = await get_path_size(part_file)
+                        LOGGER.info(f"Created {part_file}: {part_size / (1024*1024*1024):.2f} GB")
                         parts_info.append((part_file, start_time, part_size))
                         o_files.append(ospath.basename(part_file))
                         m_size.append(part_size)
-                        LOGGER.info(f"Created {part_file}: {part_size / (1024*1024*1024):.2f} GB")
                         if not is_last_part:
                             start_time += best_duration
                     except Exception as e:
                         LOGGER.error(f"Split failed for {part_file}: {e}")
-                        await self.onUploadError(f"Split failed for {file_}: {e}")
+                        await self.onUploadError(f"Split failed: {e}")
                         return False
 
-                # Post-split adjustment
-                adjusted_start_time = 0
-                for i, (part_file, old_start, part_size) in enumerate(parts_info):
-                    if not await self._adjust_part_size(input_file, part_file, adjusted_start_time, part_size, target_min_bytes, target_max_bytes, duration):
-                        LOGGER.warning(f"Adjustment failed for {part_file}")
+                # Adjust only non-final parts
+                for i, (part_file, old_start, part_size) in enumerate(parts_info[:-1]):  # Exclude last part
+                    if not await self._adjust_part_size(input_file, part_file, old_start, part_size, target_min_bytes, target_max_bytes, duration):
+                        LOGGER.warning(f"Adjustment failed for {part_file}, proceeding anyway")
                     new_size = await get_path_size(part_file)
-                    m_size[o_files.index(ospath.basename(part_file))] = new_size  # Update size in m_size
+                    m_size[i] = new_size
                     LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB")
-                    adjusted_start_time = old_start + (new_size / (file_size / duration)) if i < num_parts - 1 else duration
 
                 await clean_target(input_file)
 
@@ -351,36 +332,27 @@ class TaskListener(TaskConfig):
         return True
 
     async def _adjust_part_size(self, input_file, part_file, start_time, current_size_bytes, target_min_bytes, target_max_bytes, total_duration):
-        """Adjust part size if outside target range."""
         if target_min_bytes <= current_size_bytes <= target_max_bytes:
             LOGGER.debug(f"Part {part_file} size {current_size_bytes / (1024*1024*1024):.2f} GB is within range")
             return True
 
         remaining_duration = total_duration - start_time
-        shrink_factor = 0.95
-        expansion_factor = 1.05
-        max_attempts = 3
+        bytes_per_sec = (await get_path_size(input_file)) / total_duration
+        max_attempts = 5
 
         for attempt in range(max_attempts):
-            if current_size_bytes > target_max_bytes:
-                new_duration = remaining_duration * shrink_factor * (1 - attempt * 0.05)
-                LOGGER.debug(f"Attempt {attempt + 1}: Shrinking {part_file} from {current_size_bytes / (1024*1024*1024):.2f} GB to {new_duration:.2f}s")
-            elif current_size_bytes < target_min_bytes:
-                new_duration = min(remaining_duration * expansion_factor * (1 + attempt * 0.05), remaining_duration)
-                LOGGER.debug(f"Attempt {attempt + 1}: Expanding {part_file} from {current_size_bytes / (1024*1024*1024):.2f} GB to {new_duration:.2f}s")
-            else:
-                return True
-
+            target_duration = (target_max_bytes if current_size_bytes < target_min_bytes else target_min_bytes) / bytes_per_sec
+            new_duration = min(remaining_duration, target_duration * (1 + 0.05 * attempt if current_size_bytes < target_min_bytes else 1 - 0.05 * attempt))
             cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(new_duration), '-c', 'copy', part_file]
             try:
                 await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, check=True, timeout=300)
                 new_size = await get_path_size(part_file)
-                LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB")
+                LOGGER.debug(f"Adjusted {part_file} to {new_size / (1024*1024*1024):.2f} GB (attempt {attempt + 1})")
                 if target_min_bytes <= new_size <= target_max_bytes:
                     return True
                 current_size_bytes = new_size
             except Exception as e:
-                LOGGER.error(f"Adjustment attempt {attempt + 1} failed for {part_file}: {e}")
+                LOGGER.error(f"Adjustment failed: {e}")
                 return False
 
         LOGGER.warning(f"Failed to adjust {part_file} after {max_attempts} attempts")
@@ -389,7 +361,6 @@ class TaskListener(TaskConfig):
     async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
-            LOGGER.debug(f"Removed completed task: {self.message.link}")
 
         LOGGER.info(f"Task completed: {self.name} (MID: {self.mid})")
         dt_date, dt_time = get_date_time(self.message)

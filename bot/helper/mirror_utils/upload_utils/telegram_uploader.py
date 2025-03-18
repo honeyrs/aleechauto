@@ -28,7 +28,7 @@ class TgUploader:
         self._last_uploaded = 0
         self._processed_bytes = 0
         self._listener = listener
-        self._path = path
+        self._path = path  # Now set to split_dir or up_dir by TaskListener
         self._start_time = time()
         self._is_cancelled = False
         self._thumb = self._listener.thumb or ospath.join('thumbnails', f'{self._listener.user_id}.jpg')
@@ -57,7 +57,7 @@ class TgUploader:
         corrupted_files = total_files = 0
         LOGGER.info(f"Starting upload for {self._listener.name} with {len(o_files)} files")
 
-        for file_name in o_files:
+        for i, file_name in enumerate(o_files):
             self._up_path = ospath.join(self._path, file_name)
             if not await aiopath.exists(self._up_path):
                 LOGGER.error(f"File not found: {self._up_path}")

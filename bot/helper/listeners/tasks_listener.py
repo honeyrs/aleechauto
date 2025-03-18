@@ -149,11 +149,12 @@ class TaskListener(TaskConfig):
             up_path = one_path
 
         up_dir, self.name = ospath.split(up_path)
-        size = await get_path_size(up_dir)
+        size = await get_path_size(up_path if await aiopath.isfile(up_path) else up_dir)
 
         if self.isLeech:
             o_files, m_size = [], []
             LOGGER.info(f"Checking split for {self.name}, size: {size / (1024*1024*1024):.2f} GB")
+            split_dir = ospath.join(up_dir, "splited_files_mltb")
             result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
             if not result:
                 return
@@ -178,11 +179,13 @@ class TaskListener(TaskConfig):
 
             await start_from_queued()
 
-            total_size = await get_path_size(up_dir)
-            uploaded_size = sum(m_size)
+            total_size = size  # Use the original file size
+            uploaded_size = 0  # Initialize as 0; will update after upload
             LOGGER.info(f"Leeching: {self.name} with total size: {total_size / (1024*1024*1024):.2f} GB, uploaded parts: {uploaded_size / (1024*1024*1024):.2f} GB")
 
-            tg = TgUploader(self, up_dir, size)
+            # Use split_dir if splitting occurred, otherwise up_dir
+            upload_path = split_dir if o_files and all(f.endswith('.mkv') for f in o_files) else up_dir
+            tg = TgUploader(self, upload_path, size)
             async with task_dict_lock:
                 task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
             try:
@@ -309,7 +312,7 @@ class TaskListener(TaskConfig):
                         part_size = await get_path_size(part_file)
                         LOGGER.info(f"Created {part_file}: {part_size / (1024*1024*1024):.2f} GB")
                         parts_info.append((part_file, start_time, part_size))
-                        o_files.append(ospath.basename(part_file))
+                        o_files.append(ospath.basename(part_file))  # Still use basename, but path is adjusted in upload
                         m_size.append(part_size)
                         if not is_last_part:
                             start_time += best_duration

@@ -66,7 +66,7 @@ class TgUploader:
                 try:
                     f_size = await get_path_size(self._up_path)
                     if f_size > 1.99 * 1024 * 1024 * 1024:
-                        LOGGER.error(f"File {self._up_path} exceeds 1.99GB: {f_size / (1024*1024*1024):.2f} GB after split")
+                        LOGGER.error(f"File {self._up_path} exceeds 1.99GB: {f_size / (1024*1024*1024):.2f} GB")
                         corrupted_files += 1
                         continue
                     if self._listener.seed and file_ in o_files and f_size in m_size:

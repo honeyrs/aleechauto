@@ -143,32 +143,38 @@ class TaskListener(TaskConfig):
             if not up_path:
                 return
             self.seed = False
-            LOGGER.info(f"VidEcxecutor completed for MID: {self.mid}, proceeding to Telegram upload")
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
-            LOGGER.info(f"Leeching {self.name} (MID: {self.mid})")
-            tg = TgUploader(self, up_dir, size)
-            async with task_dict_lock:
-                task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
-            try:
-                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload([], [])), timeout=600)
-                LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
-            except AsyncTimeoutError:
-                LOGGER.error(f"Upload timeout for MID: {self.mid}")
-                await self.onUploadError("Upload timed out after 10 minutes.")
+            # Apply splitting here for vidMode before Telegram upload
+            if self.isLeech:
+                o_files, m_size = [], []
+                LOGGER.info(f"Checking split for {self.name} (size: {size / (1024*1024*1024):.2f} GB) MID: {self.mid}")
+                result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
+                if not result:
+                    return
+                LOGGER.info(f"Proceeding to Telegram upload for MID: {self.mid} with o_files: {o_files}")
+                tg = TgUploader(self, up_dir, size)
+                async with task_dict_lock:
+                    task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
+                try:
+                    await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
+                    LOGGER.info(f"Leech Completed: {self.name} (MID: {self.mid})")
+                except AsyncTimeoutError:
+                    LOGGER.error(f"Upload timeout for MID: {self.mid}")
+                    await self.onUploadError("Upload timed out after 10 minutes.")
+                    return
+                except Exception as e:
+                    LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
+                    await self.onUploadError(f"Upload failed: {str(e)}")
+                    return
+                await clean_download(self.dir)
+                async with task_dict_lock:
+                    task_dict.pop(self.mid, None)
+                async with queue_dict_lock:
+                    if self.mid in non_queued_up:
+                        non_queued_up.remove(self.mid)
+                await start_from_queued()
                 return
-            except Exception as e:
-                LOGGER.error(f"Upload error for MID: {self.mid}: {e}", exc_info=True)
-                await self.onUploadError(f"Upload failed: {str(e)}")
-                return
-            await clean_download(self.dir)
-            async with task_dict_lock:
-                task_dict.pop(self.mid, None)
-            async with queue_dict_lock:
-                if self.mid in non_queued_up:
-                    non_queued_up.remove(self.mid)
-            await start_from_queued()
-            return
 
         if one_path := await self.isOneFile(up_path):
             up_path = one_path
@@ -249,6 +255,7 @@ class TaskListener(TaskConfig):
     async def proceedSplit(self, up_dir, m_size, o_files, size, gid):
         """Split files into parts between 1.95GB and 1.99GB if needed."""
         if not self.isLeech or not await aiopath.isdir(up_dir):
+            LOGGER.info(f"No split needed: isLeech={self.isLeech}, is_dir={await aiopath.isdir(up_dir)}")
             return True
 
         target_min_bytes = 1.95 * 1024 * 1024 * 1024  # 1.95 GB
@@ -263,7 +270,9 @@ class TaskListener(TaskConfig):
                     continue
 
                 file_size = await get_path_size(input_file)
+                LOGGER.info(f"Checking file {input_file}: {file_size / (1024*1024*1024):.2f} GB")
                 if file_size <= target_max_bytes:
+                    LOGGER.info(f"File {file_} under 1.99GB, no split needed")
                     o_files.append(file_)
                     m_size.append(file_size)
                     continue
@@ -275,6 +284,7 @@ class TaskListener(TaskConfig):
                                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
                                                          text=True, check=True)
                     duration = float(duration_result.stdout.strip())
+                    LOGGER.info(f"Duration of {file_}: {duration:.2f}s")
                 except Exception as e:
                     LOGGER.error(f"Failed to get duration for {input_file}: {e}")
                     await self.onUploadError(f"Failed to split {file_}: Unable to determine duration")
@@ -283,6 +293,7 @@ class TaskListener(TaskConfig):
                 num_parts = max(1, math.ceil(file_size / target_max_bytes))
                 start_time = 0
                 base_name = ospath.splitext(file_)[0]
+                LOGGER.info(f"Splitting {file_} into {num_parts} parts")
 
                 for part_num in range(1, num_parts + 1):
                     is_last_part = (part_num == num_parts)
@@ -310,6 +321,7 @@ class TaskListener(TaskConfig):
                                 await sync_to_async(subprocess.run, cmd, capture_output=True, text=True, 
                                                    check=True, timeout=300)
                                 temp_size = await get_path_size(temp_file)
+                                LOGGER.info(f"Test split: {mid:.2f}s, size: {temp_size / (1024*1024*1024):.2f} GB")
                                 await clean_target(temp_file)
 
                                 if temp_size > target_max_bytes:

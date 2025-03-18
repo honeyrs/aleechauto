@@ -18,7 +18,7 @@ from bot.helper.ext_utils.bot_utils import sync_to_async, default_button
 from bot.helper.ext_utils.files_utils import clean_unwanted, clean_target, get_path_size, is_archive, get_base_name
 from bot.helper.ext_utils.media_utils import create_thumbnail, take_ss, get_document_type, get_media_info, get_audio_thumb, post_media_info, GenSS
 from bot.helper.ext_utils.shortenurl import short_url
-from bot.helper.listeners import tasks_listener as task
+from bot.helper.listeners import tasks_listener as task  # Keep this for reference
 from bot.helper.stream_utils.file_properties import gen_link
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import deleteMessage, handle_message
@@ -26,7 +26,7 @@ from bot.helper.telegram_helper.message_utils import deleteMessage, handle_messa
 LOGGER = getLogger(__name__)
 
 class TgUploader:
-    def __init__(self, listener: task.TaskListener, path: str, size: int):
+    def __init__(self, listener: 'task.TaskListener', path: str, size: int):
         self._last_uploaded = 0
         self._processed_bytes = 0
         self._listener = listener
@@ -44,7 +44,7 @@ class TgUploader:
         self._up_path = ''
         self._leech_log = config_dict['LEECH_LOG']
         LOGGER.debug(f"Initialized TgUploader: {self._listener.name}, Path: {self._path}, Size: {self._size}")
-
+        
     async def _upload_progress(self, current, _):
         if self._is_cancelled:
             LOGGER.info("Upload cancelled, stopping transmission")

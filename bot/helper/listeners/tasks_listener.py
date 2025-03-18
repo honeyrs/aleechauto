@@ -3,6 +3,7 @@ from asyncio import sleep, gather, wait_for, TimeoutError as AsyncTimeoutError
 from html import escape
 from os import path as ospath
 from time import time
+import math
 
 from bot import bot, bot_loop, task_dict, task_dict_lock, config_dict, non_queued_up, non_queued_dl, queued_up, queued_dl, queue_dict_lock, LOGGER, DATABASE_URL, bot_lock, DEFAULT_SPLIT_SIZE
 from bot.helper.common import TaskConfig
@@ -163,113 +164,255 @@ class TaskListener(TaskConfig):
                     non_queued_up.remove(self.mid)
             await start_from_queued()
 
-    async def _split_file(self, file_path, size, gid):
-        """Split file into parts ≤ split_size (2GB basic, 4GB premium) using FFmpeg."""
-        split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
-        if is_premium_user(self.user_id):
-            split_size = min(max(split_size, 4 * 1024**3), 4 * 1024**3)  # Max 4GB for premium
-        else:
-            split_size = min(max(split_size, 2 * 1024**3), 2 * 1024**3)  # Max 2GB for basic
-
-        LOGGER.info(f"Splitting {file_path} (size: {size}) with split_size: {split_size}")
-
-        if size <= split_size:
-            LOGGER.info(f"File size {size} ≤ split_size {split_size}, no split required")
-            return [file_path], [size]
-
-        o_files, m_size = [], []
-        output_dir = ospath.dirname(file_path)
-        base_name = ospath.splitext(ospath.basename(file_path))[0]
-
-        # Check FFmpeg availability
-        cmd = ["ffmpeg", "-version"]
-        _, stdout, stderr = await cmd_exec(cmd)
-        if stderr:
-            LOGGER.error(f"FFmpeg not available: {stderr}")
-            return [], []
-
-        # Get total duration
+    async def _get_duration(self, file_path):
+        """Get file duration using ffprobe."""
         cmd = [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)
         ]
         _, stdout, stderr = await cmd_exec(cmd)
         if stderr:
-            LOGGER.error(f"ffprobe failed: {stderr}")
-            return [], []
-        duration = float(stdout.strip())
-        LOGGER.info(f"File duration: {duration} seconds")
+            LOGGER.error(f"ffprobe failed for {file_path}: {stderr}")
+            return None
+        return float(stdout.strip())
 
-        # Calculate number of parts
-        num_parts = max(1, math.ceil(size / split_size))
-        LOGGER.info(f"Total parts needed: {num_parts}")
+    async def _get_video_info(self, file_path):
+        """Get duration and codec of a video file."""
+        duration_cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", file_path
+        ]
+        info_cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,width,height,bit_rate",
+            "-of", "csv=p=0:s=,", file_path
+        ]
+        _, duration_out, duration_err = await cmd_exec(duration_cmd)
+        _, info_out, info_err = await cmd_exec(info_cmd)
+        
+        if duration_err or info_err:
+            LOGGER.error(f"ffprobe failed: {duration_err or info_err}")
+            return None
+        
+        duration = float(duration_out.strip())
+        codec, width, height, bitrate = info_out.strip().split(',')
+        if not bitrate or bitrate == 'N/A':
+            size = await get_path_size(file_path)
+            bitrate = str(int((size * 8) / duration))
+        
+        return {
+            'duration': duration,
+            'width': int(width),
+            'height': int(height),
+            'codec': codec,
+            'bitrate': int(bitrate)
+        }
+
+    async def _generate_output_filename(self, input_file, part_num, output_dir, video_info):
+        """Generate a descriptive output filename."""
+        base_name = ospath.splitext(ospath.basename(input_file))[0]
+        if video_info:
+            height = video_info['height']
+            res = "480p" if height <= 480 else "720p" if height <= 720 else "1080p" if height <= 1080 else "4K" if height <= 2160 else f"{height}p"
+            codec = "x265" if video_info['codec'].lower() in ['hevc', 'h265'] else "x264"
+            return ospath.join(output_dir, f"{base_name}_{self.mid}.{res}.{codec}.part{part_num}.mkv")
+        return ospath.join(output_dir, f"{base_name}_{self.mid}.part{part_num}.mkv")
+
+    async def _find_optimal_split_time(self, input_file, start_time, target_min_bytes, target_max_bytes, total_duration, max_iterations=5):
+        """Find split time for a part between target_min_bytes and target_max_bytes."""
+        if self._is_cancelled:
+            return None, None
+        
+        low = 0
+        high = total_duration - start_time
+        bytes_per_second = (await get_path_size(input_file)) / total_duration
+        initial_guess = target_min_bytes / bytes_per_second
+        low, high = max(0, initial_guess * 0.9), min(high, initial_guess * 1.1)
+        
+        best_time = initial_guess
+        best_size = 0
+        iteration = 0
+        
+        LOGGER.info(f"MID: {self.mid} - Searching for split: target {target_min_bytes/(1024*1024*1024):.2f}-{target_max_bytes/(1024*1024*1024):.2f} GB, range {low:.2f}s to {high:.2f}s")
+        
+        temp_file = ospath.join(self.dir, f"temp_split_{self.mid}.mkv")
+        
+        while iteration < max_iterations and high - low > 5.0:
+            if self._is_cancelled:
+                await clean_target(temp_file)
+                return None, None
+            
+            mid = (low + high) / 2
+            cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(mid), '-c', 'copy', temp_file]
+            
+            try:
+                start = time.time()
+                _, stdout, stderr = await cmd_exec(cmd, timeout=300)
+                if stderr:
+                    LOGGER.error(f"MID: {self.mid} - FFmpeg error during split test: {stderr}")
+                    await clean_target(temp_file)
+                    return None, None
+                size = await get_path_size(temp_file)
+                await clean_target(temp_file)
+                elapsed = time.time() - start
+                
+                LOGGER.info(f"MID: {self.mid} - Iteration {iteration + 1}: Tested {mid:.2f}s, size {size / (1024*1024*1024):.2f} GB, took {elapsed:.2f}s")
+                
+                if size > target_max_bytes:
+                    high = mid
+                elif size < target_min_bytes:
+                    low = mid
+                else:
+                    best_time = mid
+                    best_size = size
+                    break
+                
+                best_time = mid
+                best_size = size
+                iteration += 1
+            except AsyncTimeoutError:
+                LOGGER.error(f"MID: {self.mid} - FFmpeg timed out after 5 minutes.")
+                await clean_target(temp_file)
+                return None, None
+        
+        LOGGER.info(f"MID: {self.mid} - Best split: {best_time:.2f}s, size {best_size / (1024*1024*1024):.2f} GB after {iteration} iterations")
+        return best_time, best_size
+
+    async def _adjust_part_size(self, input_file, part_file, start_time, current_size_bytes, target_min_bytes, target_max_bytes, total_duration):
+        """Adjust an existing part to fit target range."""
+        if self._is_cancelled:
+            return False
+        
+        if current_size_bytes >= target_min_bytes and current_size_bytes <= target_max_bytes:
+            return True
+        
+        remaining_duration = total_duration - start_time
+        if current_size_bytes > target_max_bytes:
+            shrink_factor = target_max_bytes / current_size_bytes
+            new_duration = (remaining_duration * shrink_factor * 0.95)
+            cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(new_duration), '-c', 'copy', part_file]
+            _, _, stderr = await cmd_exec(cmd)
+            if stderr:
+                LOGGER.error(f"MID: {self.mid} - FFmpeg error shrinking part: {stderr}")
+                return False
+            new_size = await get_path_size(part_file)
+            LOGGER.info(f"MID: {self.mid} - Shrunk part to {new_size / (1024*1024*1024):.2f} GB")
+            return new_size <= target_max_bytes
+        elif current_size_bytes < target_min_bytes:
+            expansion_factor = target_min_bytes / current_size_bytes
+            new_duration = min(remaining_duration * expansion_factor, remaining_duration)
+            cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(new_duration), '-c', 'copy', part_file]
+            _, _, stderr = await cmd_exec(cmd)
+            if stderr:
+                LOGGER.error(f"MID: {self.mid} - FFmpeg error expanding part: {stderr}")
+                return False
+            new_size = await get_path_size(part_file)
+            LOGGER.info(f"MID: {self.mid} - Expanded part to {new_size / (1024*1024*1024):.2f} GB")
+            return new_size >= target_min_bytes and new_size <= target_max_bytes
+        return True
+
+    async def _split_file(self, file_path, size, gid):
+        """Split file into parts between 1.95-1.99 GB (or 3.95-3.99 GB for premium)."""
+        split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
+        if is_premium_user(self.user_id):
+            split_size = min(max(split_size, 4 * 1024**3), 4 * 1024**3)
+            target_min_bytes = 3.95 * 1024 * 1024 * 1024  # 3.95 GB
+            target_max_bytes = 3.99 * 1024 * 1024 * 1024  # 3.99 GB
+        else:
+            split_size = min(max(split_size, 2 * 1024**3), 2 * 1024**3)
+            target_min_bytes = 1.95 * 1024 * 1024 * 1024  # 1.95 GB
+            target_max_bytes = 1.99 * 1024 * 1024 * 1024  # 1.99 GB
+
+        LOGGER.info(f"MID: {self.mid} - Splitting {file_path} (size: {size}) with split_size: {split_size}")
+
+        if size <= split_size:
+            LOGGER.info(f"MID: {self.mid} - File size {size} ≤ split_size {split_size}, no split required")
+            return [file_path], [size]
+
+        output_dir = ospath.dirname(file_path)
+        o_files, m_size = [], []
+
+        video_info = await self._get_video_info(file_path)
+        if not video_info:
+            return [], []
+        duration = video_info['duration']
+        num_parts = max(1, math.ceil(size / target_max_bytes))
+
+        LOGGER.info(f"MID: {self.mid} - Total size: {size / (1024*1024*1024):.2f} GB, Duration: {duration:.2f}s, Parts: {num_parts}")
 
         start_time = 0
-        bytes_per_second = size / duration
+        parts = []
 
-        for part_num in range(num_parts):
-            part_file = ospath.join(output_dir, f"{base_name}_part{part_num + 1:03d}{ospath.splitext(file_path)[1]}")
-            remaining_bytes = size - (part_num * split_size)
-
-            if remaining_bytes <= split_size:
-                # Last part: remainder
-                cmd = [
-                    "ffmpeg", "-i", str(file_path), "-ss", str(start_time),
-                    "-c", "copy", "-map", "0", "-y", str(part_file)
-                ]
+        for i in range(num_parts):
+            if self._is_cancelled:
+                await self._cleanup_files(o_files)
+                return [], []
+            
+            part_num = i + 1
+            is_last_part = (i == num_parts - 1)
+            part_file = await self._generate_output_filename(file_path, part_num, output_dir, video_info)
+            
+            if is_last_part:
+                cmd = ['ffmpeg', '-y', '-i', file_path, '-ss', str(start_time), '-c', 'copy', part_file]
+                LOGGER.info(f"MID: {self.mid} - Creating part {part_num}/{num_parts}: {ospath.basename(part_file)} (remaining)")
+                _, stdout, stderr = await cmd_exec(cmd)
+                if stderr:
+                    LOGGER.error(f"MID: {self.mid} - FFmpeg error: {stderr}")
+                    await self._cleanup_files(o_files)
+                    return [], []
+                part_size = await get_path_size(part_file)
+                LOGGER.info(f"MID: {self.mid} - Part {part_num} size: {part_size / (1024*1024*1024):.2f} GB")
+                parts.append((part_file, start_time, part_size))
             else:
-                # Full part: ≤ split_size
-                part_duration = split_size / bytes_per_second
-                cmd = [
-                    "ffmpeg", "-i", str(file_path), "-ss", str(start_time),
-                    "-fs", str(split_size), "-c", "copy", "-map", "0", "-y", str(part_file)
-                ]
+                split_duration, split_size = await self._find_optimal_split_time(file_path, start_time, target_min_bytes, target_max_bytes, duration)
+                if split_duration is None:
+                    await self._cleanup_files(o_files)
+                    return [], []
+                
+                cmd = ['ffmpeg', '-y', '-i', file_path, '-ss', str(start_time), '-t', str(split_duration), '-c', 'copy', part_file]
+                LOGGER.info(f"MID: {self.mid} - Creating part {part_num}/{num_parts}: {ospath.basename(part_file)}")
+                LOGGER.info(f"MID: {self.mid} - Time segment: {start_time:.2f}s to {(start_time + split_duration):.2f}s")
+                _, stdout, stderr = await cmd_exec(cmd)
+                if stderr:
+                    LOGGER.error(f"MID: {self.mid} - FFmpeg error: {stderr}")
+                    await self._cleanup_files(o_files)
+                    return [], []
+                part_size = await get_path_size(part_file)
+                LOGGER.info(f"MID: {self.mid} - Part {part_num} size: {part_size / (1024*1024*1024):.2f} GB")
+                parts.append((part_file, start_time, part_size))
+                start_time += split_duration
 
-            LOGGER.info(f"Executing FFmpeg for part {part_num + 1}: {' '.join(cmd)}")
-            _, stdout, stderr = await cmd_exec(cmd)
-            LOGGER.info(f"FFmpeg stdout (part {part_num + 1}): {stdout}")
-            if stderr:
-                LOGGER.error(f"FFmpeg stderr (part {part_num + 1}): {stderr}")
-            if not await aiopath.exists(part_file):
-                LOGGER.error(f"Part {part_file} not created!")
+        adjusted_start_time = 0
+        for i, (part_file, old_start, part_size) in enumerate(parts):
+            if self._is_cancelled:
                 await self._cleanup_files(o_files)
                 return [], []
-
-            part_size = await get_path_size(part_file)
-            if part_size > split_size:
-                LOGGER.error(f"Part {part_file} size {part_size} exceeds split_size {split_size}")
+            
+            part_num = i + 1
+            LOGGER.info(f"MID: {self.mid} - Rechecking part {part_num}: {part_size / (1024*1024*1024):.2f} GB")
+            if not await self._adjust_part_size(file_path, part_file, adjusted_start_time, part_size, target_min_bytes, target_max_bytes, duration):
+                LOGGER.warning(f"MID: {self.mid} - Part {part_num} could not be adjusted to target range")
+            new_size = await get_path_size(part_file)
+            if new_size > split_size:
+                LOGGER.error(f"MID: {self.mid} - Part {part_file} size {new_size} exceeds split_size {split_size}")
                 await self._cleanup_files(o_files)
                 return [], []
-
+            LOGGER.info(f"MID: {self.mid} - Final part {part_num} size: {new_size / (1024*1024*1024):.2f} GB")
             o_files.append(part_file)
-            m_size.append(part_size)
-            LOGGER.info(f"Created {part_file}, size: {part_size} bytes")
-
-            # Update start_time
-            cmd = [
-                "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1", str(part_file)
-            ]
-            _, stdout, stderr = await cmd_exec(cmd)
-            if stderr:
-                LOGGER.error(f"ffprobe failed for {part_file}: {stderr}")
-                await self._cleanup_files(o_files)
-                return [], []
-            part_duration = float(stdout.strip())
-            start_time += part_duration
-            LOGGER.info(f"Part {part_num + 1} duration: {part_duration}, New start_time: {start_time}")
+            m_size.append(new_size)
+            adjusted_start_time += await self._get_duration(part_file)
 
         total_split_size = sum(m_size)
-        LOGGER.info(f"Split complete. Total size: {total_split_size}, Original: {size}")
-        if abs(total_split_size - size) > 1024 * 1024:  # 1MB tolerance
-            LOGGER.warning(f"Size mismatch: original={size}, split_total={total_split_size}")
+        LOGGER.info(f"MID: {self.mid} - Split complete. Total size: {total_split_size}, Original: {size}")
+        if abs(total_split_size - size) > 1024 * 1024:
+            LOGGER.warning(f"MID: {self.mid} - Size mismatch: original={size}, split_total={total_split_size}")
         return o_files, m_size
 
     async def _cleanup_files(self, files):
         for f in files:
             if await aiopath.exists(f):
                 await clean_target(f)
-        LOGGER.info(f"Cleaned up files: {files}")
+        LOGGER.info(f"MID: {self.mid} - Cleaned up files: {files}")
 
     async def onUploadComplete(self, link, size, files, folders, mime_type):
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:

@@ -8,7 +8,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 from time import time
 
 from bot import bot, bot_lock, config_dict, LOGGER
-from bot.helper.ext_utils.bot_utils import sync_to_async
+from bot.helper.ext_utils.bot_utils import sync_to_async, is_premium_user
 from bot.helper.ext_utils.files_utils import clean_target, get_path_size
 from bot.helper.ext_utils.media_utils import get_document_type, get_media_info, create_thumbnail
 
@@ -52,7 +52,7 @@ class TgUploader:
     async def upload(self, o_files, m_size):
         await self._msg_to_reply()
         corrupted_files = total_files = 0
-        TELEGRAM_LIMIT = 2097152000
+        TELEGRAM_LIMIT = 4 * 1024**3 if is_premium_user(self._listener.user_id) else 2 * 1024**3  # 4GB for premium, 2GB for basic
         total_parts = len(o_files)
 
         for i, file_path in enumerate(o_files):
@@ -114,6 +114,11 @@ class TgUploader:
         thumb = self._thumb
         if self._is_cancelled:
             return
+
+        TELEGRAM_LIMIT = 4 * 1024**3 if is_premium_user(self._listener.user_id) else 2 * 1024**3  # 4GB for premium, 2GB for basic
+        file_size = await get_path_size(up_path)
+        if file_size > TELEGRAM_LIMIT:
+            raise ValueError(f"File {up_path} size {file_size} exceeds Telegram limit {TELEGRAM_LIMIT}")
 
         try:
             async with bot_lock:

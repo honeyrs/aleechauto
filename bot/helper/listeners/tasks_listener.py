@@ -174,12 +174,19 @@ class TaskListener(TaskConfig):
         LOGGER.info(f"Splitting {file_path} (size: {size}) with split_size: {split_size}")
 
         if size <= split_size:
-            LOGGER.info(f"File size {size} <= split_size {split_size}, no split required")
+            LOGGER.info(f"File size {size} ≤ split_size {split_size}, no split required")
             return [file_path], [size]
 
         o_files, m_size = [], []
         output_dir = ospath.dirname(file_path)
         base_name = ospath.splitext(ospath.basename(file_path))[0]
+
+        # Check FFmpeg availability
+        cmd = ["ffmpeg", "-version"]
+        _, stdout, stderr = await cmd_exec(cmd)
+        if stderr:
+            LOGGER.error(f"FFmpeg not available: {stderr}")
+            return [], []
 
         # Get total duration
         cmd = [
@@ -239,11 +246,16 @@ class TaskListener(TaskConfig):
             LOGGER.info(f"Created {part_file}, size: {part_size} bytes")
 
             # Update start_time
-            part_duration = await sync_to_async(get_duration, part_file)
-            if part_duration is None:
-                LOGGER.error(f"Failed to get duration for {part_file}")
+            cmd = [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(part_file)
+            ]
+            _, stdout, stderr = await cmd_exec(cmd)
+            if stderr:
+                LOGGER.error(f"ffprobe failed for {part_file}: {stderr}")
                 await self._cleanup_files(o_files)
                 return [], []
+            part_duration = float(stdout.strip())
             start_time += part_duration
             LOGGER.info(f"Part {part_num + 1} duration: {part_duration}, New start_time: {start_time}")
 
@@ -304,5 +316,3 @@ class TaskListener(TaskConfig):
             await DbManager().rm_complete_task(self.message.link)
         await sendingMessage(f"Upload failed: {error}", self.message, None)
         await start_from_queued()
-
-# TgUploader remains unchanged as provided

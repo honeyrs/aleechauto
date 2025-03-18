@@ -70,7 +70,6 @@ class TaskListener(TaskConfig):
                 return
 
         size = await get_path_size(up_path)
-        TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
 
         if self.join and await aiopath.isdir(up_path):
             await join_files(up_path)
@@ -115,7 +114,8 @@ class TaskListener(TaskConfig):
             return
 
         o_files, m_size = [], []
-        if size > TELEGRAM_LIMIT and await aiopath.isfile(up_path):
+        max_upload_size = 4 * 1024**3 if is_premium_user(self.user_id) else 2 * 1024**3
+        if size > max_upload_size and await aiopath.isfile(up_path):
             LOGGER.info(f"Splitting file {self.name} (size: {size}) into parts")
             o_files, m_size = await self._split_file(up_path, size, gid)
             if not o_files:
@@ -161,13 +161,13 @@ class TaskListener(TaskConfig):
             await start_from_queued()
 
     async def _split_file(self, file_path, size, gid):
-        """Split logic adapted from parent project's proceedSplit"""
+        """Split logic adapted from parent project, maximizing parts near 2GB/4GB"""
         # Determine split size based on user type and config
         split_size = config_dict.get('LEECH_SPLIT_SIZE', DEFAULT_SPLIT_SIZE)
         if is_premium_user(self.user_id):
-            split_size = max(split_size, 4 * 1024**3)  # 4GB for premium users
+            split_size = min(max(split_size, 4 * 1024**3), 4 * 1024**3)  # Cap at 4GB for premium
         else:
-            split_size = min(split_size, 2 * 1024**3)  # Cap at 2GB for basic users
+            split_size = min(max(split_size, 2 * 1024**3), 2 * 1024**3)  # Cap at 2GB for basic
 
         LOGGER.info(f"Splitting {file_path} (size: {size}) with split_size: {split_size}")
 
@@ -181,21 +181,21 @@ class TaskListener(TaskConfig):
         base_name = ospath.splitext(ospath.basename(file_path))[0]
         output_dir = ospath.dirname(file_path)
 
-        # Split file into parts
+        # Split file into parts, maximizing near split_size
         try:
-            num_parts = (size + split_size - 1) // split_size  # Ceiling division
-            part_size_target = size // num_parts  # Aim for equal parts where possible
+            remaining_size = size
+            part_num = 0
 
-            for part in range(num_parts):
-                output_file = ospath.join(output_dir, f"{base_name}_part{part:03d}{ospath.splitext(file_path)[1]}")
-                start_byte = part * part_size_target
-                end_byte = min((part + 1) * part_size_target, size)
+            while remaining_size > 0:
+                part_size_target = min(split_size, remaining_size)  # Max out at split_size or remainder
+                output_file = ospath.join(output_dir, f"{base_name}_part{part_num:03d}{ospath.splitext(file_path)[1]}")
+                start_byte = size - remaining_size
 
-                # Use dd or similar for splitting (async-friendly)
-                cmd = ['dd', f'if={file_path}', f'of={output_file}', f'bs={part_size_target}', f'skip={part}', 'count=1', 'status=none']
+                # Use dd for splitting
+                cmd = ['dd', f'if={file_path}', f'of={output_file}', f'bs={part_size_target}', f'skip={part_num}', 'count=1', 'status=none']
                 _, stderr, rcode = await cmd_exec(cmd)
                 if rcode != 0:
-                    LOGGER.error(f"Split failed for part {part}: {stderr}")
+                    LOGGER.error(f"Split failed for part {part_num}: {stderr}")
                     await self._cleanup_files(o_files)
                     return [], []
 
@@ -206,12 +206,14 @@ class TaskListener(TaskConfig):
 
                 part_size = await get_path_size(output_file)
                 if part_size > split_size:
-                    LOGGER.warning(f"Part {output_file} size {part_size} exceeds split_size {split_size}, retrying not implemented")
+                    LOGGER.warning(f"Part {output_file} size {part_size} exceeds split_size {split_size}")
                     await self._cleanup_files(o_files)
                     return [], []
 
                 o_files.append(output_file)
                 m_size.append(part_size)
+                remaining_size -= part_size
+                part_num += 1
 
             total_split_size = sum(m_size)
             if abs(total_split_size - size) > 1024 * 1024:  # 1MB tolerance
@@ -303,7 +305,7 @@ class TgUploader:
         await self._msg_to_reply()
         total_files = len(o_files)
         uploaded_files = 0
-        TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
+        TELEGRAM_LIMIT = 4 * 1024**3 if is_premium_user(self._listener.user_id) else 2 * 1024**3  # 4GB for premium, 2GB for basic
 
         for i, file_path in enumerate(o_files):
             if self._is_cancelled:
@@ -350,9 +352,9 @@ class TgUploader:
 
     async def _upload_file(self, caption, up_path):
         file_size = await get_path_size(up_path)
-        TELEGRAM_LIMIT = 2097152000  # 2 GB for free users
+        TELEGRAM_LIMIT = 4 * 1024**3 if is_premium_user(self._listener.user_id) else 2 * 1024**3  # 4GB for premium, 2GB for basic
         if file_size > TELEGRAM_LIMIT:
-            raise ValueError(f"File {up_path} size {file_size} exceeds Telegram 2 GB limit")
+            raise ValueError(f"File {up_path} size {file_size} exceeds Telegram limit {TELEGRAM_LIMIT}")
 
         if not await aiopath.exists(up_path):
             raise FileNotFoundError(f"Upload path missing: {up_path}")

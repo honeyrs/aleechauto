@@ -33,11 +33,10 @@ from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import limit, sendCustom, sendMedia, sendMessage, auto_delete_message, sendSticker, sendFile, copyMessage, sendingMessage, update_status_message, delete_status
 from bot.helper.video_utils.executor import VidEcxecutor
 
-# Setup logging
 logger = logging.getLogger("TaskListener")
 
+# Splitting utilities (kept here to avoid circular imports)
 def check_dependencies():
-    """Check FFmpeg and ffprobe availability."""
     for cmd in ['ffmpeg', 'ffprobe']:
         try:
             subprocess.run([cmd, '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -47,7 +46,6 @@ def check_dependencies():
     return True
 
 def get_file_size(file_path):
-    """Get file size in bytes."""
     try:
         return ospath.getsize(file_path)
     except OSError as e:
@@ -55,7 +53,6 @@ def get_file_size(file_path):
         return 0
 
 def get_video_info(file_path):
-    """Get video duration and bitrate."""
     try:
         cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
@@ -67,12 +64,11 @@ def get_video_info(file_path):
         return None
 
 def find_optimal_split_time(input_file, start_time, target_min_bytes, target_max_bytes, total_duration, max_iterations=5):
-    """Find split time for 1.95-1.99 GB parts."""
     low = 0
     high = total_duration - start_time
     bytes_per_second = get_file_size(input_file) / total_duration
     initial_guess = target_min_bytes / bytes_per_second
-    low, high = max(0, initial_guess * 0.8), min(high, initial_guess * 1.2)  # ±20% range for spikes
+    low, high = max(0, initial_guess * 0.8), min(high, initial_guess * 1.2)
 
     best_time = initial_guess
     best_size = 0
@@ -113,7 +109,6 @@ def find_optimal_split_time(input_file, start_time, target_min_bytes, target_max
     return best_time, best_size
 
 def adjust_part_size(input_file, part_file, start_time, current_size, target_min_bytes, target_max_bytes, total_duration):
-    """Adjust part to ≤ 1.99 GB if needed."""
     if current_size <= target_max_bytes:
         return True
     
@@ -259,21 +254,6 @@ class TaskListener(TaskConfig):
             if not result:
                 return
 
-            # Validate all parts before upload
-            telegram_limit = 2_097_152_000  # 2000 MiB
-            target_min_bytes = 1_990_654_771  # 1.95 GB
-            target_max_bytes = 2_028_896_563  # 1.99 GB
-            for i, (file_, size_) in enumerate(zip(o_files, m_size)):
-                full_path = ospath.join(split_dir, file_)
-                if size_ > telegram_limit or (i < len(o_files) - 1 and (size_ < target_min_bytes or size_ > target_max_bytes)):
-                    LOGGER.error(f"Part {file_} size {size_ / (1024*1024*1024):.2f} GB invalid.")
-                    await self.onUploadError("Part size validation failed.")
-                    return
-                if i == len(o_files) - 1 and size_ > target_max_bytes:
-                    LOGGER.error(f"Final part {file_} size {size_ / (1024*1024*1024):.2f} GB exceeds 1.99 GB.")
-                    await self.onUploadError("Final part size validation failed.")
-                    return
-
             add_to_queue, event = await check_running_tasks(self.mid, "up")
             if add_to_queue:
                 LOGGER.info(f"Added to upload queue: {self.name}")
@@ -295,7 +275,6 @@ class TaskListener(TaskConfig):
             await start_from_queued()
 
             total_size = size
-            uploaded_size = 0
             LOGGER.info(f"Leeching: {self.name} with total size: {total_size / (1024*1024*1024):.2f} GB")
 
             upload_path = split_dir
@@ -303,19 +282,16 @@ class TaskListener(TaskConfig):
             async with task_dict_lock:
                 task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
             try:
-                await wait_for(gather(update_status_message(self.message.chat.id), tg.upload(o_files, m_size)), timeout=600)
+                files_dict = await wait_for(tg.upload(o_files, m_size), timeout=600)
                 LOGGER.info(f"Leech completed: {self.name}")
+                if files_dict:
+                    await self.onUploadComplete(None, size, files_dict, len(o_files), 0)
             except AsyncTimeoutError:
                 await self.onUploadError("Upload timed out after 10 minutes.")
                 return
             except Exception as e:
                 await self.onUploadError(f"Upload failed: {str(e)}")
                 return
-
-            # Cleanup after successful upload
-            for file_ in o_files:
-                await aioremove(ospath.join(split_dir, file_))
-            await aioremove(up_path)  # Delete original file after all parts uploaded
         elif not self.isLeech and self.isGofile:
             LOGGER.info(f"GoFile upload: {self.name}")
             go = GoFileUploader(self)
@@ -351,74 +327,89 @@ class TaskListener(TaskConfig):
         await start_from_queued()
 
     async def proceedSplit(self, up_dir, m_size, o_files, size, gid):
-        if not self.isLeech or not await aiopath.isfile(up_dir):
-            LOGGER.debug(f"No split needed: isLeech={self.isLeech}, is_file={await aiopath.isfile(up_dir)}")
-            o_files.append(self.name)
-            m_size.append(size)
+        if not self.isLeech or not await aiopath.isdir(up_dir):
+            LOGGER.debug(f"No split needed: isLeech={self.isLeech}, is_dir={await aiopath.isdir(up_dir)}")
             return True
 
-        input_file = ospath.join(up_dir, self.name)
-        file_size = await get_path_size(input_file)
-        telegram_limit = 2_097_152_000  # 2000 MiB
         target_min_bytes = 1_990_654_771  # 1.95 GB
         target_max_bytes = 2_028_896_563  # 1.99 GB
+        telegram_limit = 2_097_152_000   # 2000 MiB
 
-        if file_size <= target_max_bytes:
-            o_files.append(self.name)
-            m_size.append(file_size)
-            return True
+        for dirpath, _, files in await sync_to_async(walk, up_dir):
+            for file_ in files:
+                input_file = ospath.join(dirpath, file_)
+                if not await aiopath.exists(input_file) or file_.endswith(('.aria2', '.!qB')):
+                    continue
 
-        video_info = get_video_info(input_file)
-        if not video_info:
-            await self.onUploadError("Failed to get video info.")
-            return False
+                file_size = get_file_size(input_file)
+                LOGGER.debug(f"Checking {input_file}: {file_size / (1024*1024*1024):.2f} GB")
+                if file_size <= target_max_bytes:
+                    o_files.append(ospath.basename(input_file))
+                    m_size.append(file_size)
+                    continue
 
-        num_parts = math.ceil(file_size / target_max_bytes)
-        full_parts = num_parts - 1
-        start_time = 0
-        parts = []
+                video_info = get_video_info(input_file)
+                if not video_info:
+                    await self.onUploadError("Failed to get video info.")
+                    return False
 
-        logger.info(f"Splitting {self.name}: {file_size / (1024*1024*1024):.2f} GB into {num_parts} parts")
+                num_parts = math.ceil(file_size / target_max_bytes)
+                full_parts = num_parts - 1
+                start_time = 0
+                parts = []
+                base_name = ospath.splitext(file_)[0]
 
-        for i in range(num_parts):
-            part_num = i + 1
-            is_last_part = (i == num_parts - 1)
-            part_file = ospath.join(self.dir, f"{ospath.splitext(self.name)[0]}.part{part_num}.mkv")
-            
-            if not is_last_part:
-                max_iter = 7 if file_size > 10_737_418_240 else 5  # 7 for > 10 GB
-                for attempt in range(2):  # 2 retries
-                    split_duration, split_size = find_optimal_split_time(input_file, start_time, target_min_bytes, target_max_bytes, video_info['duration'], max_iter)
-                    if split_duration is None:
-                        if attempt == 1:
-                            await self.onUploadError("FFmpeg failed after retries.")
-                            return False
-                        continue
-                    cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(split_duration), '-c', 'copy', part_file]
-                    subprocess.run(cmd, capture_output=True, text=True, check=True)
-                    part_size = get_file_size(part_file)
-                    if not adjust_part_size(input_file, part_file, start_time, part_size, target_min_bytes, target_max_bytes, video_info['duration']):
-                        if attempt == 1:
-                            await self.onUploadError("Failed to adjust part size.")
-                            return False
-                        aioremove(part_file)
-                        continue
-                    if target_min_bytes <= part_size <= target_max_bytes:
+                LOGGER.info(f"Splitting {file_} into {num_parts} parts")
+
+                for i in range(num_parts):
+                    part_num = i + 1
+                    is_last_part = (i == num_parts - 1)
+                    part_file = ospath.join(self.dir, f"{base_name}.part{part_num}.mkv")
+                    
+                    if not is_last_part:
+                        max_iter = 7 if file_size > 10_737_418_240 else 5
+                        for attempt in range(2):
+                            split_duration, split_size = find_optimal_split_time(input_file, start_time, target_min_bytes, target_max_bytes, video_info['duration'], max_iter)
+                            if split_duration is None:
+                                if attempt == 1:
+                                    await self.onUploadError("FFmpeg failed after retries.")
+                                    return False
+                                continue
+                            cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(split_duration), '-c', 'copy', part_file]
+                            subprocess.run(cmd, capture_output=True, text=True, check=True)
+                            part_size = get_file_size(part_file)
+                            if not adjust_part_size(input_file, part_file, start_time, part_size, target_min_bytes, target_max_bytes, video_info['duration']):
+                                if attempt == 1:
+                                    await self.onUploadError("Failed to adjust part size.")
+                                    return False
+                                aioremove(part_file)
+                                continue
+                            if target_min_bytes <= part_size <= target_max_bytes:
+                                parts.append(part_file)
+                                start_time += split_duration
+                                break
+                    else:
+                        cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-c', 'copy', part_file]
+                        subprocess.run(cmd, capture_output=True, text=True, check=True)
+                        part_size = get_file_size(part_file)
+                        if part_size > target_max_bytes:
+                            adjust_part_size(input_file, part_file, start_time, part_size, target_min_bytes, target_max_bytes, video_info['duration'])
                         parts.append(part_file)
-                        o_files.append(ospath.basename(part_file))
-                        m_size.append(part_size)
-                        start_time += split_duration
-                        break
-            else:
-                cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-c', 'copy', part_file]
-                subprocess.run(cmd, capture_output=True, text=True, check=True)
-                part_size = get_file_size(part_file)
-                if part_size > target_max_bytes:
-                    adjust_part_size(input_file, part_file, start_time, part_size, target_min_bytes, target_max_bytes, video_info['duration'])
-                parts.append(part_file)
-                o_files.append(ospath.basename(part_file))
-                m_size.append(part_size)
 
+                # Validate all parts before proceeding
+                for part in parts:
+                    size = get_file_size(part)
+                    if size > telegram_limit or (part != parts[-1] and (size < target_min_bytes or size > target_max_bytes)):
+                        logger.error(f"Part {part} size {size / (1024*1024*1024):.2f} GB invalid.")
+                        await self.onUploadError("Part size validation failed.")
+                        return False
+                
+                for part in parts:
+                    o_files.append(ospath.basename(part))
+                    m_size.append(get_file_size(part))
+                await aioremove(input_file)
+
+        LOGGER.info(f"Split completed for directory {up_dir}")
         return True
 
     async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):
@@ -524,18 +515,3 @@ class TaskListener(TaskConfig):
             await DbManager().rm_complete_task(self.message.link)
         await sendingMessage(f"Upload failed: {error}", self.message, choice(config_dict['IMAGE_COMPLETE'].split()))
         await gather(start_from_queued(), clean_download(self.dir))
-
-async def start_listener(mid):
-    """Start TaskListener for a given MID."""
-    listener = TaskListener()
-    listener.mid = mid
-    listener.dir = f"/usr/src/app/downloads/{mid}"
-    listener.message = await bot.get_messages(chat_id=config_dict['CMD_CHAT'], message_ids=int(mid))  # Adjust as per your bot setup
-    listener.user_id = listener.message.from_user.id
-    listener.isSuperChat = True  # Adjust based on your logic
-    listener.tag = "@user"  # Placeholder, adjust as needed
-    listener.isLeech = True  # Assuming leech for splitting
-    bot_loop.create_task(listener.onDownloadComplete())
-
-if __name__ == "__main__":
-    bot_loop.run_until_complete(start_listener("1638"))

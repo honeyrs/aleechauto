@@ -1,6 +1,6 @@
 from aiofiles.os import listdir, path as aiopath, makedirs, remove as aioremove
 from aioshutil import move
-from asyncio import sleep, gather, wait_for, TimeoutError as AsyncTimeoutError
+from asyncio import sleep, gather, wait_for, TimeoutError as AsyncTimeoutError, Event
 from html import escape
 from os import walk, path as ospath
 from random import choice
@@ -102,6 +102,7 @@ class TaskListener(TaskConfig):
         super().__init__()
         if not check_dependencies():
             raise Exception("FFmpeg/ffprobe missing. TaskListener cannot proceed.")
+        LOGGER.info("TaskListener initialized")
 
     @staticmethod
     async def clean():
@@ -112,6 +113,7 @@ class TaskListener(TaskConfig):
                     intvl.cancel()
                 Intervals['status'].clear()
             await gather(sync_to_async(aria2.purge), delete_status())
+            LOGGER.info("Cleanup completed")
         except Exception as e:
             LOGGER.error(f"Error during cleanup: {e}")
 
@@ -120,16 +122,20 @@ class TaskListener(TaskConfig):
         if self.sameDir and self.mid in self.sameDir['tasks']:
             self.sameDir['tasks'].remove(self.mid)
             self.sameDir['total'] -= 1
+            LOGGER.info(f"Removed MID {self.mid} from sameDir")
 
     async def onDownloadStart(self):
         """Handle download start event."""
+        LOGGER.info(f"Download started for MID: {self.mid}")
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
 
     async def onDownloadComplete(self):
         """Handle download completion and trigger FFmpeg/upload."""
+        LOGGER.info(f"onDownloadComplete called for MID: {self.mid}")
         multi_links = False
         if self.sameDir and self.mid in self.sameDir['tasks']:
+            LOGGER.info(f"Waiting for sameDir tasks for MID: {self.mid}, total: {self.sameDir['total']}")
             while not (self.sameDir['total'] in [1, 0] or self.sameDir['total'] > 1 and len(self.sameDir['tasks']) > 1):
                 await sleep(0.5)
 
@@ -173,11 +179,13 @@ class TaskListener(TaskConfig):
 
         up_path = ospath.join(self.dir, self.name)
         size = await get_path_size(up_path)
+        LOGGER.info(f"File size for {self.name}: {size / (1024*1024*1024):.2f} GB")
 
         if not config_dict.get('QUEUE_ALL') and not config_dict.get('QUEUE_COMPLETE'):
             async with queue_dict_lock:
                 if self.mid in non_queued_dl:
                     non_queued_dl.remove(self.mid)
+                    LOGGER.info(f"Removed MID {self.mid} from non_queued_dl")
             await start_from_queued()
 
         if self.join and await aiopath.isdir(up_path):
@@ -238,6 +246,7 @@ class TaskListener(TaskConfig):
 
         up_dir, self.name = ospath.split(up_path)
         size = await get_path_size(up_path if await aiopath.isfile(up_path) else up_dir)
+        LOGGER.info(f"Post-FFmpeg path: {up_path}, size: {size / (1024*1024*1024):.2f} GB")
 
         # Queue FFmpeg if needed
         if ffmpeg_needed and task_type not in ['extract', 'sample', 'compress', 'split'] and not self.vidMode:
@@ -246,10 +255,12 @@ class TaskListener(TaskConfig):
                 ffmpeg_queue[self.mid] = (event, task_type, up_path)
                 LOGGER.info(f"Queued FFmpeg for MID: {self.mid}, type: {task_type}")
             await event.wait()
-            if active_ffmpeg != self.mid:
-                return
             global active_ffmpeg
+            if active_ffmpeg != self.mid:
+                LOGGER.info(f"FFmpeg not active for MID: {self.mid}, skipping")
+                return
             active_ffmpeg = None
+            LOGGER.info(f"FFmpeg completed for MID: {self.mid}")
 
         # Queue Upload
         add_to_queue, event = await check_running_tasks(self.mid, "up")
@@ -260,10 +271,12 @@ class TaskListener(TaskConfig):
             await event.wait()
             async with task_dict_lock:
                 if self.mid not in task_dict:
+                    LOGGER.info(f"MID {self.mid} removed from task_dict during queue wait")
                     return
             LOGGER.info(f"Starting from Queue/Upload: {self.name} (MID: {self.mid})")
         async with queue_dict_lock:
             non_queued_up.add(self.mid)
+            LOGGER.info(f"Added MID {self.mid} to non_queued_up")
 
         # Upload
         if self.isLeech:
@@ -313,12 +326,16 @@ class TaskListener(TaskConfig):
         async with queue_dict_lock:
             if self.mid in non_queued_up:
                 non_queued_up.remove(self.mid)
+                LOGGER.info(f"Removed MID {self.mid} from non_queued_up")
             if self.mid in non_queued_dl:
                 non_queued_dl.remove(self.mid)
+                LOGGER.info(f"Removed MID {self.mid} from non_queued_dl")
         await start_from_queued()
+        LOGGER.info(f"Task fully completed for MID: {self.mid}")
 
     async def proceedSplit(self, up_dir, m_size, o_files, size, gid):
         """Split large files into 1.90-1.99 GB parts for Telegram."""
+        LOGGER.info(f"proceedSplit called for MID: {self.mid}, dir: {up_dir}")
         if not self.isLeech or not await aiopath.isdir(up_dir):
             LOGGER.debug(f"No split needed: isLeech={self.isLeech}, is_dir={await aiopath.isdir(up_dir)}")
             return True
@@ -506,10 +523,13 @@ class TaskListener(TaskConfig):
 
     # Placeholder methods (implement as needed from your original logic)
     async def proceedExtract(self, up_path, size, gid):
+        LOGGER.info(f"proceedExtract placeholder called for {up_path}")
         return up_path
 
     async def generateSampleVideo(self, up_path, gid):
+        LOGGER.info(f"generateSampleVideo placeholder called for {up_path}")
         return up_path
 
     async def proceedCompress(self, up_path, size, gid):
+        LOGGER.info(f"proceedCompress placeholder called for {up_path}")
         return up_path

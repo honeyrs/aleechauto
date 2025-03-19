@@ -308,7 +308,7 @@ class TaskListener(TaskConfig):
                 async with task_dict_lock:
                     task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
                 try:
-                    await wait_for(event.wait(), timeout=300)
+                    await wait_for(event.wait(), timeout=1800)
                 except AsyncTimeoutError:
                     await self.onUploadError("Upload queue timeout.")
                     return
@@ -330,7 +330,7 @@ class TaskListener(TaskConfig):
             async with task_dict_lock:
                 task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
             try:
-                files_dict = await wait_for(tg.upload(o_files, m_size), timeout=600)
+                files_dict = await wait_for(tg.upload(o_files, m_size), timeout=3600)
                 LOGGER.info(f"Leech completed: {self.name}")
                 if files_dict:
                     await self.onUploadComplete(None, size, files_dict, len(o_files), 0)

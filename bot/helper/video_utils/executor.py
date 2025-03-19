@@ -136,7 +136,7 @@ class VidEcxecutor(FFProgress):
             async with task_dict_lock:
                 task_dict[self.listener.mid] = QueueStatus(self.listener, self.size, self._gid, 'Up')
             try:
-                await wait_for(event.wait(), timeout=300)
+                await wait_for(event.wait(), timeout=1800)
             except AsyncTimeoutError:
                 LOGGER.error(f"Queue timeout for MID: {self.listener.mid}")
                 await self._cleanup()

@@ -18,7 +18,6 @@ from bot.helper.ext_utils.files_utils import get_path_size, clean_download, clea
 from bot.helper.ext_utils.links_utils import is_magnet, is_url, get_link, is_media, is_gdrive_link, get_stream_link, is_gdrive_id
 from bot.helper.ext_utils.shortenurl import short_url
 from bot.helper.ext_utils.status_utils import action, get_date_time, get_readable_file_size, get_readable_time
-from bot.helper.ext_utils.task_manager import start_from_queued, check_running_tasks
 from bot.helper.ext_utils.telegraph_helper import TelePost
 from bot.helper.mirror_utils.gdrive_utlis.upload import gdUpload
 from bot.helper.mirror_utils.rclone_utils.transfer import RcloneTransferHelper
@@ -32,11 +31,13 @@ from bot.helper.mirror_utils.upload_utils.telegram_uploader import TgUploader
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import limit, sendCustom, sendMedia, sendMessage, auto_delete_message, sendSticker, sendFile, copyMessage, sendingMessage, update_status_message, delete_status
 from bot.helper.video_utils.executor import VidEcxecutor
+from .task_manager import check_running_tasks, ffmpeg_queue, ffmpeg_queue_lock, active_ffmpeg, start_from_queued
 
 logger = logging.getLogger("TaskListener")
 
 # Splitting utilities
 def check_dependencies():
+    """Verify FFmpeg and ffprobe are installed."""
     for cmd in ['ffmpeg', 'ffprobe']:
         try:
             subprocess.run([cmd, '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -46,6 +47,7 @@ def check_dependencies():
     return True
 
 def get_file_size(file_path):
+    """Get file size in bytes."""
     try:
         return ospath.getsize(file_path)
     except OSError as e:
@@ -53,6 +55,7 @@ def get_file_size(file_path):
         return 0
 
 def get_video_info(file_path):
+    """Get video duration and bitrate."""
     try:
         cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
@@ -63,39 +66,8 @@ def get_video_info(file_path):
         logger.error(f"Error getting video info for {file_path}: {e}")
         return None
 
-def probe_split_time(input_file, start_time, target_size, total_duration):
-    """Estimate split time using ffprobe bitrate, adjust once if needed."""
-    video_info = get_video_info(input_file)
-    if not video_info:
-        return None, None
-    avg_bitrate = get_file_size(input_file) / video_info['duration']  # bytes/s
-    guess_time = target_size / avg_bitrate
-    temp_file = ospath.join(ospath.dirname(input_file), "probe_temp.mkv")
-    cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(guess_time), '-c', 'copy', temp_file]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
-        size = get_file_size(temp_file)
-        if 1_931_069_952 <= size <= 2_028_896_563:  # 1.90-1.99 GB
-            return guess_time, size
-        # Adjust once
-        adjustment = (target_size - size) / avg_bitrate
-        new_time = guess_time + adjustment
-        if new_time <= 0 or new_time >= total_duration - start_time:
-            aioremove(temp_file)
-            return None, None
-        cmd[6] = str(new_time)  # Update -t
-        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
-        size = get_file_size(temp_file)
-        return new_time, size
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
-        logger.error(f"Probe split failed: {e}")
-    finally:
-        if ospath.exists(temp_file):
-            aioremove(temp_file)
-    return None, None
-
 def smart_guess_split(input_file, start_time, target_min, target_max, total_duration, max_iterations=5):
-    """Binary search with tight range, 3-5 iterations."""
+    """Binary search to split video into 1.90-1.99 GB parts."""
     bytes_per_second = get_file_size(input_file) / total_duration
     guess = target_max / bytes_per_second
     low, high = guess * 0.95, min(total_duration - start_time, guess * 1.05)  # ±5%
@@ -125,54 +97,6 @@ def smart_guess_split(input_file, start_time, target_min, target_max, total_dura
             return None, None
     return best_time if 1_931_069_952 <= best_size <= 2_028_896_563 else None, best_size
 
-def precise_split(input_file, start_time, target_min, target_max, total_duration, max_iterations=10):
-    """Binary search with more iterations for precision."""
-    bytes_per_second = get_file_size(input_file) / total_duration
-    guess = target_max / bytes_per_second
-    low, high = guess * 0.9, min(total_duration - start_time, guess * 1.1)  # ±10%
-    best_time, best_size = guess, 0
-    for i in range(max_iterations):
-        mid = (low + high) / 2
-        temp_file = ospath.join(ospath.dirname(input_file), "precise_temp.mkv")
-        cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(mid), '-c', 'copy', temp_file]
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
-            size = get_file_size(temp_file)
-            aioremove(temp_file)
-            logger.info(f"Precise Iter {i+1}: {mid:.2f}s, {size / (1024*1024*1024):.2f} GB")
-            if 1_931_069_952 <= size <= 2_028_896_563:  # 1.90-1.99 GB
-                return mid, size
-            elif size > 2_028_896_563:
-                high = mid
-            elif size < 1_931_069_952:
-                low = mid
-            best_time, best_size = mid, size
-            if high - low < 1.0:  # High precision
-                break
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
-            logger.error(f"Precise split failed: {e}")
-            if ospath.exists(temp_file):
-                aioremove(temp_file)
-            return None, None
-    return best_time if 1_931_069_952 <= best_size <= 2_028_896_563 else None, best_size
-
-def adjust_part_size(input_file, part_file, start_time, current_size, target_min, target_max, total_duration):
-    if 1_931_069_952 <= current_size <= 2_028_896_563:
-        return True
-    if current_size > 2_028_896_563:  # Only shrink if > 1.99 GB
-        shrink_factor = target_max / current_size
-        new_duration = (total_duration - start_time) * shrink_factor * 0.95
-        cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(new_duration), '-c', 'copy', part_file]
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            new_size = get_file_size(part_file)
-            logger.info(f"Shrunk to {new_size / (1024*1024*1024):.2f} GB")
-            return 1_931_069_952 <= new_size <= 2_028_896_563
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Adjust failed: {e}")
-            return False
-    return False  # Don't adjust upward, rely on splitting methods
-
 class TaskListener(TaskConfig):
     def __init__(self):
         super().__init__()
@@ -181,28 +105,32 @@ class TaskListener(TaskConfig):
 
     @staticmethod
     async def clean():
+        """Clean up intervals and aria2 tasks."""
         try:
-            if st := Intervals['status']:
+            if st := Intervals.get('status', {}):
                 for intvl in list(st.values()):
                     intvl.cancel()
-            Intervals['status'].clear()
+                Intervals['status'].clear()
             await gather(sync_to_async(aria2.purge), delete_status())
         except Exception as e:
             LOGGER.error(f"Error during cleanup: {e}")
 
     def removeFromSameDir(self):
+        """Remove task from sameDir tracking."""
         if self.sameDir and self.mid in self.sameDir['tasks']:
             self.sameDir['tasks'].remove(self.mid)
             self.sameDir['total'] -= 1
 
     async def onDownloadStart(self):
+        """Handle download start event."""
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
 
     async def onDownloadComplete(self):
+        """Handle download completion and trigger FFmpeg/upload."""
         multi_links = False
         if self.sameDir and self.mid in self.sameDir['tasks']:
-            while not (self.sameDir['total'] in [1, 0] or self.sameDir['total'] > 1 and len(self.sameDir['tasks']) > 1):
+            while.Concurrent not (self.sameDir['total'] in [1, 0] or self.sameDir['total'] > 1 and len(self.sameDir['tasks']) > 1):
                 await sleep(0.5)
 
         async with task_dict_lock:
@@ -246,7 +174,7 @@ class TaskListener(TaskConfig):
         up_path = ospath.join(self.dir, self.name)
         size = await get_path_size(up_path)
 
-        if not config_dict['QUEUE_ALL'] and not config_dict['QUEUE_COMPLETE']:
+        if not config_dict.get('QUEUE_ALL') and not config_dict.get('QUEUE_COMPLETE'):
             async with queue_dict_lock:
                 if self.mid in non_queued_dl:
                     non_queued_dl.remove(self.mid)
@@ -255,21 +183,29 @@ class TaskListener(TaskConfig):
         if self.join and await aiopath.isdir(up_path):
             await join_files(up_path)
 
+        # FFmpeg Processing
+        ffmpeg_needed = False
+        task_type = None
+        o_files, m_size = [], []
         if self.extract:
+            ffmpeg_needed = True
+            task_type = 'extract'
             up_path = await self.proceedExtract(up_path, size, gid)
             if not up_path:
                 return
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
-
-        if self.sampleVideo:
+        elif self.sampleVideo:
+            ffmpeg_needed = True
+            task_type = 'sample'
             up_path = await self.generateSampleVideo(up_path, gid)
             if not up_path:
                 return
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
-
-        if self.compress:
+        elif self.compress:
+            ffmpeg_needed = True
+            task_type = 'compress'
             if self.vidMode:
                 up_path = await VidEcxecutor(self, up_path, gid).execute()
                 if not up_path:
@@ -278,8 +214,9 @@ class TaskListener(TaskConfig):
             up_path = await self.proceedCompress(up_path, size, gid)
             if not up_path:
                 return
-
-        if not self.compress and self.vidMode:
+        elif not self.compress and self.vidMode:
+            ffmpeg_needed = True
+            task_type = self.vidMode[0]
             LOGGER.info(f"Processing video with VidEcxecutor: {self.name}")
             up_path = await VidEcxecutor(self, up_path, gid).execute()
             if not up_path:
@@ -287,6 +224,14 @@ class TaskListener(TaskConfig):
             self.seed = False
             up_dir, self.name = ospath.split(up_path)
             size = await get_path_size(up_dir)
+        elif self.isLeech and size > 1_931_069_952:  # Split if > 1.90 GB
+            ffmpeg_needed = True
+            task_type = 'split'
+            split_dir = self.dir
+            result = await self.proceedSplit(up_dir if await aiopath.isdir(up_path) else ospath.dirname(up_path), m_size, o_files, size, gid)
+            if not result:
+                return
+            up_path = split_dir
 
         if one_path := await self.isOneFile(up_path):
             up_path = one_path
@@ -294,46 +239,44 @@ class TaskListener(TaskConfig):
         up_dir, self.name = ospath.split(up_path)
         size = await get_path_size(up_path if await aiopath.isfile(up_path) else up_dir)
 
-        if self.isLeech:
-            o_files, m_size = [], []
-            LOGGER.info(f"Checking split for {self.name}, size: {size / (1024*1024*1024):.2f} GB")
-            split_dir = self.dir  # Use MID directory directly
-            result = await self.proceedSplit(up_dir, m_size, o_files, size, gid)
-            if not result:
+        # Queue FFmpeg if needed
+        if ffmpeg_needed and task_type not in ['extract', 'sample', 'compress', 'split'] and not self.vidMode:
+            event = Event()
+            async with ffmpeg_queue_lock:
+                ffmpeg_queue[self.mid] = (event, task_type, up_path)
+                LOGGER.info(f"Queued FFmpeg for MID: {self.mid}, type: {task_type}")
+            await event.wait()
+            if active_ffmpeg != self.mid:
                 return
+            global active_ffmpeg
+            active_ffmpeg = None
 
-            add_to_queue, event = await check_running_tasks(self.mid, "up")
-            if add_to_queue:
-                LOGGER.info(f"Added to upload queue: {self.name}")
-                async with task_dict_lock:
-                    task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
-                try:
-                    await wait_for(event.wait(), timeout=1800)
-                except AsyncTimeoutError:
-                    await self.onUploadError("Upload queue timeout.")
+        # Queue Upload
+        add_to_queue, event = await check_running_tasks(self.mid, "up")
+        if add_to_queue:
+            LOGGER.info(f"Added to Queue/Upload: {self.name} (MID: {self.mid})")
+            async with task_dict_lock:
+                task_dict[self.mid] = QueueStatus(self, size, gid, 'Up')
+            await event.wait()
+            async with task_dict_lock:
+                if self.mid not in task_dict:
                     return
-                async with task_dict_lock:
-                    if self.mid not in task_dict:
-                        return
-                LOGGER.info(f"Starting from queue: {self.name}")
+            LOGGER.info(f"Starting from Queue/Upload: {self.name} (MID: {self.mid})")
+        async with queue_dict_lock:
+            non_queued_up.add(self.mid)
 
-            async with queue_dict_lock:
-                non_queued_up.add(self.mid)
-
-            await start_from_queued()
-
-            total_size = size
-            LOGGER.info(f"Leeching: {self.name} with total size: {total_size / (1024*1024*1024):.2f} GB")
-
-            upload_path = split_dir
+        # Upload
+        if self.isLeech:
+            LOGGER.info(f"Leeching: {self.name} with total size: {size / (1024*1024*1024):.2f} GB")
+            upload_path = split_dir if task_type == 'split' else up_path
             tg = TgUploader(self, upload_path, size)
             async with task_dict_lock:
                 task_dict[self.mid] = TelegramStatus(self, tg, size, gid, 'up')
             try:
-                files_dict = await wait_for(tg.upload(o_files, m_size), timeout=3600)
+                files_dict = await wait_for(tg.upload(o_files, m_size) if task_type == 'split' else tg.upload([ospath.basename(up_path)], [size]), timeout=3600)
                 LOGGER.info(f"Leech completed: {self.name}")
                 if files_dict:
-                    await self.onUploadComplete(None, size, files_dict, len(o_files), 0)
+                    await self.onUploadComplete(None, size, files_dict, len(o_files) if task_type == 'split' else 1, 0)
             except AsyncTimeoutError:
                 await self.onUploadError("Upload timed out after 10 minutes.")
                 return
@@ -375,6 +318,7 @@ class TaskListener(TaskConfig):
         await start_from_queued()
 
     async def proceedSplit(self, up_dir, m_size, o_files, size, gid):
+        """Split large files into 1.90-1.99 GB parts for Telegram."""
         if not self.isLeech or not await aiopath.isdir(up_dir):
             LOGGER.debug(f"No split needed: isLeech={self.isLeech}, is_dir={await aiopath.isdir(up_dir)}")
             return True
@@ -415,19 +359,9 @@ class TaskListener(TaskConfig):
                     part_file = ospath.join(self.dir, f"{base_name}.part{part_num}.mkv")
 
                     if not is_last_part:
-                        # Try Probe
-                        split_duration, split_size = probe_split_time(input_file, start_time, target_max_bytes, video_info['duration'])
-                        method = "Probe"
+                        split_duration, split_size = smart_guess_split(input_file, start_time, target_min_bytes, target_max_bytes, video_info['duration'])
                         if split_duration is None or not (target_min_bytes <= split_size <= target_max_bytes):
-                            # Try Smart Guess
-                            split_duration, split_size = smart_guess_split(input_file, start_time, target_min_bytes, target_max_bytes, video_info['duration'])
-                            method = "Smart Guess"
-                        if split_duration is None or not (target_min_bytes <= split_size <= target_max_bytes):
-                            # Try Precise
-                            split_duration, split_size = precise_split(input_file, start_time, target_min_bytes, target_max_bytes, video_info['duration'])
-                            method = "Precise"
-                        if split_duration is None or not (target_min_bytes <= split_size <= target_max_bytes):
-                            await self.onUploadError(f"Failed to split part {part_num} into 1.90-1.99 GB using {method}.")
+                            await self.onUploadError(f"Failed to split part {part_num} into 1.90-1.99 GB.")
                             return False
 
                         cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(split_duration), '-c', 'copy', part_file]
@@ -443,7 +377,8 @@ class TaskListener(TaskConfig):
                         subprocess.run(cmd, capture_output=True, text=True, check=True)
                         part_size = get_file_size(part_file)
                         if part_size > telegram_limit:
-                            adjust_part_size(input_file, part_file, start_time, part_size, target_min_bytes, target_max_bytes, video_info['duration'])
+                            await self.onUploadError(f"Last part exceeds Telegram limit: {part_size / (1024*1024):.2f} MiB.")
+                            return False
                         parts.append(part_file)
 
                 # Validate all parts
@@ -463,6 +398,7 @@ class TaskListener(TaskConfig):
         return True
 
     async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):
+        """Handle upload completion."""
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
 
@@ -472,7 +408,7 @@ class TaskListener(TaskConfig):
         buttons_scr = ButtonMaker()
         size_str = get_readable_file_size(size)
         reply_to = self.message.reply_to_message
-        images = choice(config_dict['IMAGE_COMPLETE'].split())
+        images = choice(config_dict['IMAGE_COMPLETE'].split()) if config_dict.get('IMAGE_COMPLETE') else None
 
         thumb_path = ospath.join(self.dir, 'thumb.png')
         if not await aiopath.exists(thumb_path):
@@ -483,7 +419,7 @@ class TaskListener(TaskConfig):
         msg += f'<b>┌ Size: </b>{size_str}\n'
 
         if self.isLeech:
-            if config_dict['SOURCE_LINK']:
+            if config_dict.get('SOURCE_LINK'):
                 scr_link = get_link(self.message)
                 if is_magnet(scr_link):
                     tele = TelePost(config_dict['SOURCE_LINK_TITLE'])
@@ -524,7 +460,7 @@ class TaskListener(TaskConfig):
 
         if self.user_dict.get('enable_pm') and self.isSuperChat:
             await copyMessage(self.user_id, uploadmsg, buttons_scr.build_menu(2))
-        if chat_id := config_dict.get('LEECH_LOG') if self.isLeech else config_dict.get('MIRROR_LOG'):
+        if chat_id := (config_dict.get('LEECH_LOG') if self.isLeech else config_dict.get('MIRROR_LOG')):
             await copyMessage(chat_id, uploadmsg)
 
         await clean_download(self.dir)
@@ -543,25 +479,37 @@ class TaskListener(TaskConfig):
                 non_queued_up.remove(self.mid)
         await start_from_queued()
 
-        if self.isSuperChat and (stime := config_dict['AUTO_DELETE_UPLOAD_MESSAGE_DURATION']):
+        if self.isSuperChat and (stime := config_dict.get('AUTO_DELETE_UPLOAD_MESSAGE_DURATION')):
             bot_loop.create_task(auto_delete_message(self.message, uploadmsg, reply_to, stime=stime))
 
     async def onDownloadError(self, error, listfile=None):
+        """Handle download errors."""
         LOGGER.error(f"Download error: {error}")
         async with task_dict_lock:
             task_dict.pop(self.mid, None)
         await self.clean()
         if self.isSuperChat and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
-        await sendingMessage(f"Download failed: {error}", self.message, choice(config_dict['IMAGE_COMPLETE'].split()))
+        await sendingMessage(f"Download failed: {error}", self.message, choice(config_dict['IMAGE_COMPLETE'].split()) if config_dict.get('IMAGE_COMPLETE') else None)
         await gather(start_from_queued(), clean_download(self.dir))
 
     async def onUploadError(self, error):
+        """Handle upload errors."""
         LOGGER.error(f"Upload error: {error}")
         async with task_dict_lock:
             task_dict.pop(self.mid, None)
         await self.clean()
         if self.isSuperChat and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
-        await sendingMessage(f"Upload failed: {error}", self.message, choice(config_dict['IMAGE_COMPLETE'].split()))
+        await sendingMessage(f"Upload failed: {error}", self.message, choice(config_dict['IMAGE_COMPLETE'].split()) if config_dict.get('IMAGE_COMPLETE') else None)
         await gather(start_from_queued(), clean_download(self.dir))
+
+    # Placeholder methods (implement as needed from your original logic)
+    async def proceedExtract(self, up_path, size, gid):
+        return up_path
+
+    async def generateSampleVideo(self, up_path, gid):
+        return up_path
+
+    async def proceedCompress(self, up_path, size, gid):
+        return up_path

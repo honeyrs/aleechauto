@@ -35,7 +35,7 @@ from bot.helper.video_utils.executor import VidEcxecutor
 
 logger = logging.getLogger("TaskListener")
 
-# Splitting utilities (kept here to avoid circular imports)
+# Splitting utilities
 def check_dependencies():
     for cmd in ['ffmpeg', 'ffprobe']:
         try:
@@ -63,67 +63,115 @@ def get_video_info(file_path):
         logger.error(f"Error getting video info for {file_path}: {e}")
         return None
 
-def find_optimal_split_time(input_file, start_time, target_min_bytes, target_max_bytes, total_duration, max_iterations=5):
-    low = 0
-    high = total_duration - start_time
+def probe_split_time(input_file, start_time, target_size, total_duration):
+    """Estimate split time using ffprobe bitrate, adjust once if needed."""
+    video_info = get_video_info(input_file)
+    if not video_info:
+        return None, None
+    avg_bitrate = get_file_size(input_file) / video_info['duration']  # bytes/s
+    guess_time = target_size / avg_bitrate
+    temp_file = ospath.join(ospath.dirname(input_file), "probe_temp.mkv")
+    cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(guess_time), '-c', 'copy', temp_file]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
+        size = get_file_size(temp_file)
+        if 1_931_069_952 <= size <= 2_028_896_563:  # 1.90-1.99 GB
+            return guess_time, size
+        # Adjust once
+        adjustment = (target_size - size) / avg_bitrate
+        new_time = guess_time + adjustment
+        if new_time <= 0 or new_time >= total_duration - start_time:
+            aioremove(temp_file)
+            return None, None
+        cmd[6] = str(new_time)  # Update -t
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
+        size = get_file_size(temp_file)
+        return new_time, size
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+        logger.error(f"Probe split failed: {e}")
+    finally:
+        if ospath.exists(temp_file):
+            aioremove(temp_file)
+    return None, None
+
+def smart_guess_split(input_file, start_time, target_min, target_max, total_duration, max_iterations=5):
+    """Binary search with tight range, 3-5 iterations."""
     bytes_per_second = get_file_size(input_file) / total_duration
-    initial_guess = target_min_bytes / bytes_per_second
-    low, high = max(0, initial_guess * 0.8), min(high, initial_guess * 1.2)
-
-    best_time = initial_guess
-    best_size = 0
-    iteration = 0
-
-    logger.info(f"Searching split: {start_time:.2f}s, target 1.95-1.99 GB, range {low:.2f}s-{high:.2f}s")
-    
-    while iteration < max_iterations and high - low > 5.0:
+    guess = target_max / bytes_per_second
+    low, high = guess * 0.95, min(total_duration - start_time, guess * 1.05)  # ±5%
+    best_time, best_size = guess, 0
+    for i in range(max_iterations):
         mid = (low + high) / 2
-        temp_file = ospath.join(ospath.dirname(input_file), "temp_split.mkv")
+        temp_file = ospath.join(ospath.dirname(input_file), "smart_temp.mkv")
         cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(mid), '-c', 'copy', temp_file]
-        
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
             size = get_file_size(temp_file)
             aioremove(temp_file)
-            logger.info(f"Iteration {iteration + 1}: {mid:.2f}s, {size / (1024*1024*1024):.2f} GB")
-            
-            if size > target_max_bytes:
+            logger.info(f"Smart Iter {i+1}: {mid:.2f}s, {size / (1024*1024*1024):.2f} GB")
+            if 1_931_069_952 <= size <= 2_028_896_563:  # 1.90-1.99 GB
+                return mid, size
+            elif size > 2_028_896_563:
                 high = mid
-            elif size < target_min_bytes:
+            elif size < 1_931_069_952:
                 low = mid
-            else:
-                best_time = mid
-                best_size = size
+            best_time, best_size = mid, size
+            if high - low < 2.0:  # Tight convergence
                 break
-            
-            best_time = mid
-            best_size = size
-            iteration += 1
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
-            logger.error(f"FFmpeg failed: {e}")
+            logger.error(f"Smart guess failed: {e}")
             if ospath.exists(temp_file):
                 aioremove(temp_file)
             return None, None
-    
-    logger.info(f"Best split: {best_time:.2f}s, {best_size / (1024*1024*1024):.2f} GB")
-    return best_time, best_size
+    return best_time if 1_931_069_952 <= best_size <= 2_028_896_563 else None, best_size
 
-def adjust_part_size(input_file, part_file, start_time, current_size, target_min_bytes, target_max_bytes, total_duration):
-    if current_size <= target_max_bytes:
+def precise_split(input_file, start_time, target_min, target_max, total_duration, max_iterations=10):
+    """Binary search with more iterations for precision."""
+    bytes_per_second = get_file_size(input_file) / total_duration
+    guess = target_max / bytes_per_second
+    low, high = guess * 0.9, min(total_duration - start_time, guess * 1.1)  # ±10%
+    best_time, best_size = guess, 0
+    for i in range(max_iterations):
+        mid = (low + high) / 2
+        temp_file = ospath.join(ospath.dirname(input_file), "precise_temp.mkv")
+        cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(mid), '-c', 'copy', temp_file]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
+            size = get_file_size(temp_file)
+            aioremove(temp_file)
+            logger.info(f"Precise Iter {i+1}: {mid:.2f}s, {size / (1024*1024*1024):.2f} GB")
+            if 1_931_069_952 <= size <= 2_028_896_563:  # 1.90-1.99 GB
+                return mid, size
+            elif size > 2_028_896_563:
+                high = mid
+            elif size < 1_931_069_952:
+                low = mid
+            best_time, best_size = mid, size
+            if high - low < 1.0:  # High precision
+                break
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+            logger.error(f"Precise split failed: {e}")
+            if ospath.exists(temp_file):
+                aioremove(temp_file)
+            return None, None
+    return best_time if 1_931_069_952 <= best_size <= 2_028_896_563 else None, best_size
+
+def adjust_part_size(input_file, part_file, start_time, current_size, target_min, target_max, total_duration):
+    if 1_931_069_952 <= current_size <= 2_028_896_563:
         return True
-    
-    remaining_duration = total_duration - start_time
-    shrink_factor = target_max_bytes / current_size
-    new_duration = remaining_duration * shrink_factor * 0.95
-    cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(new_duration), '-c', 'copy', part_file]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-        new_size = get_file_size(part_file)
-        logger.info(f"Shrunk to {new_size / (1024*1024*1024):.2f} GB")
-        return new_size <= target_max_bytes
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Adjust failed: {e}")
-        return False
+    if current_size > 2_028_896_563:  # Only shrink if > 1.99 GB
+        shrink_factor = target_max / current_size
+        new_duration = (total_duration - start_time) * shrink_factor * 0.95
+        cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(new_duration), '-c', 'copy', part_file]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            new_size = get_file_size(part_file)
+            logger.info(f"Shrunk to {new_size / (1024*1024*1024):.2f} GB")
+            return 1_931_069_952 <= new_size <= 2_028_896_563
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Adjust failed: {e}")
+            return False
+    return False  # Don't adjust upward, rely on splitting methods
 
 class TaskListener(TaskConfig):
     def __init__(self):
@@ -331,9 +379,9 @@ class TaskListener(TaskConfig):
             LOGGER.debug(f"No split needed: isLeech={self.isLeech}, is_dir={await aiopath.isdir(up_dir)}")
             return True
 
-        target_min_bytes = 1_990_654_771  # 1.95 GB
+        target_min_bytes = 1_931_069_952  # 1.90 GB
         target_max_bytes = 2_028_896_563  # 1.99 GB
-        telegram_limit = 2_097_152_000   # 2000 MiB
+        telegram_limit = 2_097_152_000    # 2000 MiB
 
         for dirpath, _, files in await sync_to_async(walk, up_dir):
             for file_ in files:
@@ -353,50 +401,52 @@ class TaskListener(TaskConfig):
                     await self.onUploadError("Failed to get video info.")
                     return False
 
+                num_full_parts = math.floor(file_size / target_max_bytes)
                 num_parts = math.ceil(file_size / target_max_bytes)
-                full_parts = num_parts - 1
                 start_time = 0
                 parts = []
                 base_name = ospath.splitext(file_)[0]
 
-                LOGGER.info(f"Splitting {file_} into {num_parts} parts")
+                LOGGER.info(f"Splitting {file_} into {num_parts} parts, {num_full_parts} full")
 
                 for i in range(num_parts):
                     part_num = i + 1
                     is_last_part = (i == num_parts - 1)
                     part_file = ospath.join(self.dir, f"{base_name}.part{part_num}.mkv")
-                    
+
                     if not is_last_part:
-                        max_iter = 7 if file_size > 10_737_418_240 else 5
-                        for attempt in range(2):
-                            split_duration, split_size = find_optimal_split_time(input_file, start_time, target_min_bytes, target_max_bytes, video_info['duration'], max_iter)
-                            if split_duration is None:
-                                if attempt == 1:
-                                    await self.onUploadError("FFmpeg failed after retries.")
-                                    return False
-                                continue
-                            cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(split_duration), '-c', 'copy', part_file]
-                            subprocess.run(cmd, capture_output=True, text=True, check=True)
-                            part_size = get_file_size(part_file)
-                            if not adjust_part_size(input_file, part_file, start_time, part_size, target_min_bytes, target_max_bytes, video_info['duration']):
-                                if attempt == 1:
-                                    await self.onUploadError("Failed to adjust part size.")
-                                    return False
-                                aioremove(part_file)
-                                continue
-                            if target_min_bytes <= part_size <= target_max_bytes:
-                                parts.append(part_file)
-                                start_time += split_duration
-                                break
+                        # Try Probe
+                        split_duration, split_size = probe_split_time(input_file, start_time, target_max_bytes, video_info['duration'])
+                        method = "Probe"
+                        if split_duration is None or not (target_min_bytes <= split_size <= target_max_bytes):
+                            # Try Smart Guess
+                            split_duration, split_size = smart_guess_split(input_file, start_time, target_min_bytes, target_max_bytes, video_info['duration'])
+                            method = "Smart Guess"
+                        if split_duration is None or not (target_min_bytes <= split_size <= target_max_bytes):
+                            # Try Precise
+                            split_duration, split_size = precise_split(input_file, start_time, target_min_bytes, target_max_bytes, video_info['duration'])
+                            method = "Precise"
+                        if split_duration is None or not (target_min_bytes <= split_size <= target_max_bytes):
+                            await self.onUploadError(f"Failed to split part {part_num} into 1.90-1.99 GB using {method}.")
+                            return False
+
+                        cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(split_duration), '-c', 'copy', part_file]
+                        subprocess.run(cmd, capture_output=True, text=True, check=True)
+                        part_size = get_file_size(part_file)
+                        if not (target_min_bytes <= part_size <= target_max_bytes):
+                            await self.onUploadError(f"Part {part_num} size {part_size / (1024*1024*1024):.2f} GB out of range.")
+                            return False
+                        parts.append(part_file)
+                        start_time += split_duration
                     else:
                         cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-c', 'copy', part_file]
                         subprocess.run(cmd, capture_output=True, text=True, check=True)
                         part_size = get_file_size(part_file)
-                        if part_size > target_max_bytes:
+                        if part_size > telegram_limit:
                             adjust_part_size(input_file, part_file, start_time, part_size, target_min_bytes, target_max_bytes, video_info['duration'])
                         parts.append(part_file)
 
-                # Validate all parts before proceeding
+                # Validate all parts
                 for part in parts:
                     size = get_file_size(part)
                     if size > telegram_limit or (part != parts[-1] and (size < target_min_bytes or size > target_max_bytes)):

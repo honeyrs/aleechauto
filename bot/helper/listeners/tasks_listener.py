@@ -130,7 +130,7 @@ class TaskListener(TaskConfig):
         """Handle download completion and trigger FFmpeg/upload."""
         multi_links = False
         if self.sameDir and self.mid in self.sameDir['tasks']:
-            while.Concurrent not (self.sameDir['total'] in [1, 0] or self.sameDir['total'] > 1 and len(self.sameDir['tasks']) > 1):
+            while not (self.sameDir['total'] in [1, 0] or self.sameDir['total'] > 1 and len(self.sameDir['tasks']) > 1):
                 await sleep(0.5)
 
         async with task_dict_lock:

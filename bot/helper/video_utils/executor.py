@@ -118,6 +118,7 @@ class VidEcxecutor(FFProgress):
 
     async def execute(self):
         """Execute FFmpeg task via queue."""
+        global active_ffmpeg  # Declare global at the start
         self._is_dir = await aiopath.isdir(self.path)
         try:
             self.mode, self.name, kwargs = self.listener.vidMode
@@ -152,7 +153,6 @@ class VidEcxecutor(FFProgress):
                     await self._cleanup()
                     await self.listener.onUploadError(f"{self.mode} processing failed.")
                     return None
-                global active_ffmpeg
                 active_ffmpeg = None  # Signal completion
                 event.set()
                 LOGGER.info(f"FFmpeg completed for MID: {self.listener.mid}")

@@ -1,172 +1,226 @@
-from aiofiles.os import path as aiopath, makedirs
-from aioshutil import copy
-from asyncio import sleep
-from logging import getLogger
+from aiofiles.os import remove as aioremove, path as aiopath, listdir
+from asyncio import gather, sleep, create_subprocess_exec
+from asyncio.subprocess import PIPE
+from hashlib import sha1
+from math import ceil
 from natsort import natsorted
 from os import path as ospath, walk
-from pyrogram.errors import FloodWait, RPCError
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from random import randrange
 from time import time
 
-from bot import bot, config_dict, LOGGER
-from bot.helper.ext_utils.files_utils import clean_unwanted, clean_target, get_path_size, get_base_name
-from bot.helper.ext_utils.media_utils import get_document_type, get_media_info, take_ss
-
-LOGGER = getLogger(__name__)
+from bot import task_dict, task_dict_lock, LOGGER, config_dict, non_queued_up, queue_dict_lock, bot
+from bot.helper.ext_utils.bot_utils import sync_to_async, get_readable_time
+from bot.helper.ext_utils.files_utils import get_path_size, clean_target
+from bot.helper.ext_utils.links_utils import is_gdrive_link
+from bot.helper.ext_utils.media_utils import get_document_type, take_ss, get_video_resolution
+from bot.helper.mirror_utils.status_utils.telegram_status import TelegramStatus
+from bot.helper.telegram_helper.button_build import ButtonMaker
+from bot.helper.telegram_helper.message_utils import sendMessage, editMessage, sendFile
 
 class TgUploader:
-    def __init__(self, listener, path: str, size: int):
+    def __init__(self, listener, path: str, size=0):
         self._listener = listener
         self._path = path
-        self._size = size
-        self._processed_bytes = 0
-        self._last_uploaded = 0
-        self._start_time = time()
+        self._size = size or get_path_size(path)
+        self._sent_msg = None
+        self._file = None
         self._is_cancelled = False
-        self._thumb = ospath.join(self._path, 'thumb.jpg') if ospath.exists(ospath.join(self._path, 'thumb.jpg')) else None
-        self._msgs_dict = {}
-        LOGGER.info(f"Initialized TgUploader for {self._listener.name} (MID: {self._listener.mid}), path: {self._path}")
-
-    async def upload(self, o_files: list, m_size: list):
-        """Upload files to Telegram."""
-        LOGGER.info(f"Starting upload for {self._listener.name} (MID: {self._listener.mid}) with {len(o_files)} files")
-        total_files = 0
-
-        for file_name, file_size in zip(o_files, m_size):
-            if self._is_cancelled:
-                LOGGER.info(f"Upload cancelled for {self._listener.name} (MID: {self._listener.mid})")
-                return None
-
-            self._up_path = ospath.join(self._path, file_name)
-            if not await aiopath.exists(self._up_path):
-                LOGGER.error(f"File not found: {self._up_path}")
-                continue
-            if file_size > 2_097_152_000:  # Telegram limit: 2000 MiB
-                LOGGER.warning(f"Skipping {file_name}: Size {file_size / (1024*1024):.2f} MiB exceeds Telegram limit")
-                continue
-
-            caption = f'<code>{file_name}</code>'
-            if total_files == 0 and not self._thumb and await aiopath.isfile(self._up_path):
-                is_video, _, _ = await get_document_type(self._up_path)
-                if is_video:
-                    self._thumb = await take_ss(self._up_path, None)
-                    if self._is_cancelled:
-                        return None
-
-            LOGGER.info(f"Uploading {file_name} ({file_size / (1024*1024):.2f} MiB)")
-            await self._upload_file(caption, file_name)
-            total_files += 1
-            await sleep(3)  # Avoid flooding
-
-        if total_files == 0:
-            LOGGER.error(f"No valid files uploaded for {self._listener.name} (MID: {self._listener.mid})")
-            await self._listener.onUploadError("No files could be uploaded.")
-            return None
-
-        LOGGER.info(f"Upload completed: {self._listener.name} (MID: {self._listener.mid}), {total_files} files")
-        return self._msgs_dict
-
-    @retry(wait=wait_exponential(multiplier=2, min=4, max=8), stop=stop_after_attempt(4), retry=retry_if_exception_type(Exception))
-    async def _upload_file(self, caption, file, force_document=False):
-        """Upload a single file with retry logic."""
-        if self._is_cancelled:
-            LOGGER.info(f"Stopping transmission for {file} due to cancellation")
-            bot.stop_transmission()
-            return
-
-        try:
-            is_video, is_audio, _ = await get_document_type(self._up_path)
-            if not force_document and (is_video or is_audio):
-                metadata = await get_media_info(self._up_path)
-                width = metadata.get('width', 0)
-                height = metadata.get('height', 0) if is_video else 0
-                duration = metadata.get('duration', 0)
-
-                if is_video:
-                    sent_msg = await bot.send_video(
-                        chat_id=self._listener.message.chat.id,
-                        video=self._up_path,
-                        caption=caption,
-                        duration=duration,
-                        width=width,
-                        height=height,
-                        thumb=self._thumb,
-                        supports_streaming=True,
-                        disable_notification=True,
-                        progress=self._upload_progress,
-                        reply_to_message_id=self._listener.message.id
-                    )
-                else:  # is_audio
-                    sent_msg = await bot.send_audio(
-                        chat_id=self._listener.message.chat.id,
-                        audio=self._up_path,
-                        caption=caption,
-                        duration=duration,
-                        disable_notification=True,
-                        progress=self._upload_progress,
-                        reply_to_message_id=self._listener.message.id
-                    )
-            else:
-                sent_msg = await bot.send_document(
-                    chat_id=self._listener.message.chat.id,
-                    document=self._up_path,
-                    caption=caption,
-                    thumb=self._thumb,
-                    disable_notification=True,
-                    progress=self._upload_progress,
-                    reply_to_message_id=self._listener.message.id
-                )
-
-            self._msgs_dict[sent_msg.link] = file
-            LOGGER.info(f"Uploaded {file} to {sent_msg.link}")
-
-            if not self._is_cancelled and await aiopath.exists(self._up_path):
-                await clean_target(self._up_path)
-            if self._thumb and await aiopath.exists(self._thumb) and self._thumb != ospath.join(self._path, 'thumb.jpg'):
-                await clean_target(self._thumb)
-
-        except FloodWait as f:
-            LOGGER.warning(f"FloodWait: Sleeping for {f.value * 1.2}s")
-            await sleep(f.value * 1.2)
-            raise  # Retry after sleep
-        except RPCError as err:
-            LOGGER.error(f"RPCError: {err}")
-            if 'Telegram says: [400' in str(err) or 'MEDIA_EMPTY' in str(err):
-                LOGGER.info(f"Forcing document upload for {file}")
-                await self._upload_file(caption, file, True)
-            else:
-                raise
-        except Exception as e:
-            LOGGER.error(f"Upload error for {file}: {e}", exc_info=True)
-            raise
-
-    async def _upload_progress(self, current, total):
-        """Track upload progress."""
-        if self._is_cancelled:
-            LOGGER.info("Cancelling upload via progress callback")
-            bot.stop_transmission()
-            return
-
-        chunk_size = current - self._last_uploaded
-        self._last_uploaded = current
-        self._processed_bytes += chunk_size
-        # LOGGER.debug(f"Progress: {current}/{total} bytes uploaded")
+        self._thumb = None
+        self._files_dict = {}
+        self._total_files = 0
+        self._sent_files = 0
+        self._start_time = time()
+        self._last_uploaded = 0
+        LOGGER.info(f"Initialized TgUploader for MID: {self._listener.mid}, path: {self._path}")
 
     @property
     def speed(self):
-        """Calculate upload speed in bytes per second."""
-        try:
-            return self._processed_bytes / (time() - self._start_time)
-        except ZeroDivisionError:
-            return 0
+        """Calculate upload speed."""
+        elapsed = max(time() - self._start_time, 1)
+        return (self._sent_files * self._size - self._last_uploaded) / elapsed
 
     @property
-    def processed_bytes(self):
-        """Return total bytes uploaded."""
-        return self._processed_bytes
+    def uploaded_bytes(self):
+        """Total bytes uploaded."""
+        return self._sent_files * self._size
 
-    async def cancel_task(self):
-        """Cancel the upload task."""
+    @property
+    def total_size(self):
+        """Total size of all files."""
+        return self._total_files * self._size
+
+    async def _gen_thumb(self, video_file, duration):
+        """Generate thumbnail from video."""
+        thumb_path = ospath.join(self._path, f'thumb_{self._listener.mid}.jpg')
+        try:
+            await take_ss(video_file, thumb_path, duration // 2)
+            if await aiopath.exists(thumb_path) and get_path_size(thumb_path) > 0:
+                LOGGER.info(f"Generated thumbnail: {thumb_path}")
+                return thumb_path
+            LOGGER.warning(f"Thumbnail generation failed for {video_file}")
+            return None
+        except Exception as e:
+            LOGGER.error(f"Thumbnail error: {e}")
+            if await aiopath.exists(thumb_path):
+                await aioremove(thumb_path)
+            return None
+
+    async def _send_file(self, file_, multi_files=False):
+        """Send file to Telegram with progress tracking."""
+        self._file = file_
+        try:
+            is_video, *_ = await get_document_type(file_)
+            split_size = 2_097_152_000  # Telegram bot limit (2GB)
+            file_size = get_path_size(file_)
+            LOGGER.info(f"Sending file: {file_}, size: {file_size / (1024*1024):.2f} MB")
+
+            if file_size > split_size:
+                base_name = ospath.splitext(file_)[0]
+                parts = ceil(file_size / split_size)
+                duration = (await get_video_resolution(file_))[2] if is_video else 0
+                self._thumb = await self._gen_thumb(file_, duration) if is_video and not self._thumb else self._thumb
+
+                for i in range(parts):
+                    if self._is_cancelled:
+                        return
+                    part_file = f"{base_name}.part{i+1}{ospath.splitext(file_)[1]}"
+                    start_bytes = i * split_size
+                    cmd = [
+                        'ffmpeg', '-i', file_, '-ss', str(start_bytes / 1_000_000),
+                        '-fs', str(split_size), '-c', 'copy', '-map', '0', '-y', part_file
+                    ]
+                    process = await create_subprocess_exec(*cmd, stderr=PIPE)
+                    self._listener.suproc = process
+                    _, stderr = await process.communicate()
+                    if process.returncode != 0 or not await aiopath.exists(part_file):
+                        LOGGER.error(f"Split error for {file_}, part {i+1}: {stderr.decode()}")
+                        raise Exception(f"Failed to split {file_}")
+                    await self._send_part(part_file, is_video, duration, i + 1, parts)
+                    await aioremove(part_file)
+            else:
+                duration = (await get_video_resolution(file_))[2] if is_video else 0
+                self._thumb = await self._gen_thumb(file_, duration) if is_video and not self._thumb else self._thumb
+                await self._send_part(file_, is_video, duration, 1 if multi_files else None, None)
+
+        except Exception as e:
+            LOGGER.error(f"Error sending file {file_}: {e}")
+            self._is_cancelled = True
+            if multi_files:
+                await clean_target(file_)
+        finally:
+            if not multi_files and await aiopath.exists(file_):
+                await clean_target(file_)
+            if self._thumb and await aiopath.exists(self._thumb):
+                await aioremove(self._thumb)
+
+    async def _send_part(self, part_file, is_video, duration, part_num=None, total_parts=None):
+        """Send individual file part to Telegram."""
+        caption = f"{ospath.basename(self._path)}.part{part_num}" if part_num else ospath.basename(self._path)
+        try:
+            async with task_dict_lock:
+                if self._listener.mid not in task_dict:
+                    LOGGER.warning(f"MID {self._listener.mid} not in task_dict, aborting upload")
+                    self._is_cancelled = True
+                    return
+                task_dict[self._listener.mid] = TelegramStatus(self._listener, self, self._size, self._listener.gid, 'up')
+
+            if not self._sent_msg:
+                self._sent_msg = await sendMessage('Uploading...', self._listener.message)
+            if is_video:
+                sent_file = await sendFile(
+                    self._sent_msg.chat.id, part_file, self._listener.message,
+                    caption=caption, thumb=self._thumb, duration=duration,
+                    progress=self.progress, progress_args=(self._sent_msg, self._start_time, None, True)
+                )
+            else:
+                sent_file = await sendFile(
+                    self._sent_msg.chat.id, part_file, self._listener.message,
+                    caption=caption, progress=self.progress, progress_args=(self._sent_msg, self._start_time, None, True)
+                )
+            if sent_file:
+                self._files_dict[caption] = f"https://t.me/c/{str(sent_file.chat.id)[4:]}/{sent_file.id}"
+                self._sent_files += 1
+                self._last_uploaded = self.uploaded_bytes
+                LOGGER.info(f"Uploaded {caption} for MID: {self._listener.mid}")
+        except Exception as e:
+            LOGGER.error(f"Error sending part {part_file}: {e}")
+            self._is_cancelled = True
+
+    async def progress(self, current, total, message, start_time, info=None, active=True):
+        """Update upload progress."""
+        if self._is_cancelled:
+            bot.stop_transmission()
+        elapsed = time() - start_time
+        speed = current / elapsed if elapsed > 0 else 0
+        percentage = current * 100 / total
+        eta = (total - current) / speed if speed > 0 else 0
+        progress_text = f"{info or 'Uploading...'}\n" + \
+                        f"Progress: {percentage:.2f}%\n" + \
+                        f"Speed: {get_readable_time(speed)}/s\n" + \
+                        f"ETA: {get_readable_time(eta)}\n"
+        await editMessage(progress_text, message)
+
+    async def upload(self, o_files=None, m_size=None):
+        """Upload files to Telegram."""
+        if not self._listener.isLeech:
+            LOGGER.error(f"Task is not leech for MID: {self._listener.mid}")
+            await self._listener.onUploadError("This task is not set for Telegram upload.")
+            return None
+
+        try:
+            if o_files and m_size:
+                self._total_files = len(o_files)
+                files = [(ospath.join(self._path, f), s) for f, s in zip(o_files, m_size)]
+            elif await aiopath.isfile(self._path):
+                self._total_files = 1
+                files = [(self._path, self._size)]
+            else:
+                files = []
+                for dirpath, _, fnames in await sync_to_async(walk, self._path):
+                    for file in natsorted(fnames):
+                        file_path = ospath.join(dirpath, file)
+                        if not file.endswith(('.aria2', '.!qB')):
+                            files.append((file_path, get_path_size(file_path)))
+                self._total_files = len(files)
+
+            if not files:
+                await sendMessage("No files to upload.", self._listener.message)
+                return None
+
+            for file_path, file_size in files:
+                if self._is_cancelled:
+                    break
+                self._size = file_size
+                self._sent_files = 0
+                self._last_uploaded = 0
+                self._start_time = time()
+                await self._send_file(file_path, multi_files=len(files) > 1)
+
+            if self._is_cancelled:
+                await self._listener.onUploadError("Upload cancelled or failed.")
+                return None
+
+            if self._sent_msg:
+                buttons = ButtonMaker()
+                if not is_gdrive_link(self._listener.link):
+                    buttons.button_link("Original Link", self._listener.link)
+                await editMessage(f"Uploaded {self._sent_files}/{self._total_files} files successfully.", self._sent_msg, buttons.build_menu(1))
+
+            LOGGER.info(f"Upload completed for MID: {self._listener.mid}, files uploaded: {self._sent_files}")
+            return self._files_dict
+
+        except Exception as e:
+            LOGGER.error(f"Upload error for MID: {self._listener.mid}: {e}")
+            await self._listener.onUploadError(f"Upload failed: {str(e)}")
+            return None
+        finally:
+            async with queue_dict_lock:
+                non_queued_up.discard(self._listener.mid)
+            await start_from_queued()
+
+    def cancel_download(self):
+        """Cancel the upload process."""
         self._is_cancelled = True
-        LOGGER.info(f"Upload cancelled for {self._listener.name} (MID: {self._listener.mid})")
-        await self._listener.onUploadError('Upload stopped by user!')
+        LOGGER.info(f"Upload cancelled for MID: {self._listener.mid}")
+        if self._sent_msg:
+            bot.stop_transmission()

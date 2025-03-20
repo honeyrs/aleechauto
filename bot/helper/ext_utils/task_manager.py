@@ -40,6 +40,7 @@ async def stop_duplicate_check(listener):
             name = presuf_remname_name(listener.user_dict, name)
         count, file = await sync_to_async(gdSearch(stopDup=True, noMulti=listener.isClone).drive_list, name, listener.upDest, listener.user_id)
         if count:
+            LOGGER.info(f"Duplicate found: {name}")
             return file, name
     LOGGER.info('Checking duplicate is passed...')
     return None, ''
@@ -63,12 +64,14 @@ async def check_limits_size(listener, size, playlist=False, play_count=False):
         msgerr = f'Zip/Unzip limit is {zuzdl}GB'
     elif leechdl and listener.isLeech and size >= leechdl * 1024**3:
         msgerr = f'Leech limit is {leechdl}GB'
-    if is_mega_link(listener.link) and megadl and size >= megadl * 1024**3:
+    elif is_mega_link(listener.link) and megadl and size >= megadl * 1024**3:
         msgerr = f'Mega limit is {megadl}GB'
-    if max_pyt and playlist and (play_count > max_pyt):
+    elif max_pyt and playlist and (play_count > max_pyt):
         msgerr = f'Only {max_pyt} playlist allowed. Current playlist is {play_count}.'
-    if storage and not await check_storage_threshold(size, arch):
+    elif storage and not await check_storage_threshold(size, arch):
         msgerr = f'Need {storage}GB free storage'
+    if msgerr:
+        LOGGER.info(f"Limit check failed: {msgerr}")
     return msgerr
 
 async def check_running_tasks(mid: int, state='dl'):
@@ -84,6 +87,7 @@ async def check_running_tasks(mid: int, state='dl'):
     async with target_lock:
         if state == 'up' and mid in non_queued_dl:
             non_queued_dl.remove(mid)
+            LOGGER.info(f"Removed MID {mid} from non_queued_dl for upload")
         dl_count, up_count = len(non_queued_dl), len(non_queued_up)
         is_over_limit = (all_limit > 0 and dl_count + up_count >= all_limit) or \
                         (state_limit > 0 and len(target_non_queued) >= state_limit)
@@ -92,7 +96,7 @@ async def check_running_tasks(mid: int, state='dl'):
             target_queued[mid] = event
         else:
             target_non_queued.add(mid)
-        LOGGER.info(f"Check {state} - MID: {mid}, dl_count: {dl_count}, up_count: {up_count}, all_limit: {all_limit}, state_limit: {state_limit}, is_over_limit: {is_over_limit}")
+        LOGGER.info(f"Check {state} - MID: {mid}, dl_count: {dl_count}, up_count: {up_count}, all_limit: {all_limit}, state_limit: {state_limit}, queued: {is_over_limit}")
     return is_over_limit, event
 
 async def start_dl_from_queued(mid: int):
@@ -103,6 +107,8 @@ async def start_dl_from_queued(mid: int):
             queued_dl[mid].set()
             del queued_dl[mid]
             non_queued_dl.add(mid)
+        else:
+            LOGGER.warning(f"MID {mid} not found in queued_dl")
     await sleep(0.5)
 
 async def start_up_from_queued(mid: int):
@@ -113,13 +119,19 @@ async def start_up_from_queued(mid: int):
             queued_up[mid].set()
             del queued_up[mid]
             non_queued_up.add(mid)
+        else:
+            LOGGER.warning(f"MID {mid} not found in queued_up")
     await sleep(0.5)
 
 async def start_task_from_queued(task_type, limit, non_queued, queued):
     """Start tasks from queue based on limit."""
-    async with (queue_dict_lock if task_type == 'dl' else upload_queue_lock):
+    target_lock = queue_dict_lock if task_type == 'dl' else upload_queue_lock
+    async with target_lock:
         count = len(non_queued)
-        if queued and (limit == 0 or count < limit):
+        if not queued:
+            LOGGER.info(f"No {task_type} tasks in queue to start")
+            return
+        if limit == 0 or count < limit:
             to_start = len(queued) if limit == 0 else min(limit - count, len(queued))
             LOGGER.info(f"Starting {task_type} tasks - count: {count}, limit: {limit}, to_start: {to_start}")
             mids = list(queued.keys())[:to_start]
@@ -129,28 +141,40 @@ async def start_task_from_queued(task_type, limit, non_queued, queued):
                 else:
                     await start_dl_from_queued(mid)
             LOGGER.info(f"Released {task_type} tasks: {mids}")
+        else:
+            LOGGER.info(f"{task_type} limit reached: {count}/{limit}")
 
 async def run_ffmpeg_manager():
     """Manage FFmpeg queue - 1 task at a time."""
     global active_ffmpeg
     while True:
-        async with ffmpeg_queue_lock:
-            if active_ffmpeg is None and ffmpeg_queue:
-                mid, (event, task_type, file_details) = next(iter(ffmpeg_queue.items()))
-                active_ffmpeg = mid
-                LOGGER.info(f"Starting FFmpeg for MID: {mid}, type: {task_type}")
-                del ffmpeg_queue[mid]
-        await sleep(1)  # Wait for executor to process
+        try:
+            async with ffmpeg_queue_lock:
+                if active_ffmpeg is None and ffmpeg_queue:
+                    mid, (event, task_type, file_details) = next(iter(ffmpeg_queue.items()))
+                    active_ffmpeg = mid
+                    LOGGER.info(f"Starting FFmpeg for MID: {mid}, type: {task_type}")
+                    del ffmpeg_queue[mid]
+                    event.set()  # Signal VidEcxecutor or TaskListener to proceed
+            await sleep(1)
+        except Exception as e:
+            LOGGER.error(f"FFmpeg manager error: {e}")
+            await sleep(5)  # Prevent tight loop on error
 
 async def run_upload_manager():
     """Manage upload queue - 1 task at a time."""
     while True:
-        async with upload_queue_lock:
-            up_count = len(non_queued_up)
-            if up_count < 1 and queued_up:
-                mid = next(iter(queued_up))
-                await start_up_from_queued(mid)
-        await sleep(1)
+        try:
+            async with upload_queue_lock:
+                up_count = len(non_queued_up)
+                if up_count < 1 and queued_up:
+                    mid = next(iter(queued_up))
+                    await start_up_from_queued(mid)
+                    LOGGER.info(f"Started upload for MID: {mid}")
+            await sleep(1)
+        except Exception as e:
+            LOGGER.error(f"Upload manager error: {e}")
+            await sleep(5)
 
 async def start_from_queued():
     """Start tasks from download and upload queues."""

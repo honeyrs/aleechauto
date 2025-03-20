@@ -9,10 +9,11 @@ from random import randrange
 from time import time
 
 from bot import task_dict, task_dict_lock, LOGGER, config_dict, non_queued_up, queue_dict_lock, bot
-from bot.helper.ext_utils.bot_utils import sync_to_async, get_readable_time
+from bot.helper.ext_utils.bot_utils import sync_to_async
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target
 from bot.helper.ext_utils.links_utils import is_gdrive_link
 from bot.helper.ext_utils.media_utils import get_document_type, take_ss, get_video_resolution
+from bot.helper.ext_utils.status_utils import get_readable_time  # Corrected import
 from bot.helper.mirror_utils.status_utils.telegram_status import TelegramStatus
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import sendMessage, editMessage, sendFile
@@ -35,22 +36,18 @@ class TgUploader:
 
     @property
     def speed(self):
-        """Calculate upload speed."""
         elapsed = max(time() - self._start_time, 1)
         return (self._sent_files * self._size - self._last_uploaded) / elapsed
 
     @property
     def uploaded_bytes(self):
-        """Total bytes uploaded."""
         return self._sent_files * self._size
 
     @property
     def total_size(self):
-        """Total size of all files."""
         return self._total_files * self._size
 
     async def _gen_thumb(self, video_file, duration):
-        """Generate thumbnail from video."""
         thumb_path = ospath.join(self._path, f'thumb_{self._listener.mid}.jpg')
         try:
             await take_ss(video_file, thumb_path, duration // 2)
@@ -66,7 +63,6 @@ class TgUploader:
             return None
 
     async def _send_file(self, file_, multi_files=False):
-        """Send file to Telegram with progress tracking."""
         self._file = file_
         try:
             is_video, *_ = await get_document_type(file_)
@@ -114,7 +110,6 @@ class TgUploader:
                 await aioremove(self._thumb)
 
     async def _send_part(self, part_file, is_video, duration, part_num=None, total_parts=None):
-        """Send individual file part to Telegram."""
         caption = f"{ospath.basename(self._path)}.part{part_num}" if part_num else ospath.basename(self._path)
         try:
             async with task_dict_lock:
@@ -147,7 +142,6 @@ class TgUploader:
             self._is_cancelled = True
 
     async def progress(self, current, total, message, start_time, info=None, active=True):
-        """Update upload progress."""
         if self._is_cancelled:
             bot.stop_transmission()
         elapsed = time() - start_time
@@ -161,7 +155,6 @@ class TgUploader:
         await editMessage(progress_text, message)
 
     async def upload(self, o_files=None, m_size=None):
-        """Upload files to Telegram."""
         if not self._listener.isLeech:
             LOGGER.error(f"Task is not leech for MID: {self._listener.mid}")
             await self._listener.onUploadError("This task is not set for Telegram upload.")
@@ -219,7 +212,6 @@ class TgUploader:
             await start_from_queued()
 
     def cancel_download(self):
-        """Cancel the upload process."""
         self._is_cancelled = True
         LOGGER.info(f"Upload cancelled for MID: {self._listener.mid}")
         if self._sent_msg:

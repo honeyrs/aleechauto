@@ -421,7 +421,7 @@ class TaskListener(TaskConfig):
             task_dict.pop(self.mid, None)
         await self.clean()
         if self.isSuperChat and DATABASE_URL:
-            await DbManager().rm_complete_task(self.message.link Debian)
+            await DbManager().rm_complete_task(self.message.link, Debian)
         await sendingMessage(f"Download failed: {error}", self.message, None)
         await gather(start_from_queued(), clean_download(self.dir))
 

@@ -1,5 +1,9 @@
 from asyncio import sleep, Event, Lock
 from bot import config_dict, bot_loop, LOGGER, task_dict, task_dict_lock
+from bot.helper.ext_utils.bot_utils import sync_to_async, presuf_remname_name, is_premium_user
+from bot.helper.ext_utils.files_utils import get_base_name, check_storage_threshold
+from bot.helper.ext_utils.links_utils import is_gdrive_id, is_mega_link
+from bot.helper.mirror_utils.gdrive_utlis.search import gdSearch
 from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
 
 # Queue structures

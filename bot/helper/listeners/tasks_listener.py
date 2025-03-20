@@ -26,7 +26,7 @@ from bot.helper.mirror_utils.upload_utils.telegram_uploader import TgUploader
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import sendingMessage, update_status_message, delete_status
 from bot.helper.video_utils.executor import VidEcxecutor
-from bot.helper.ext_utils.task_manager import check_running_tasks, ffmpeg_queue, ffmpeg_queue_lock, active_ffmpeg, start_from_queued  # Corrected import
+from bot.helper.ext_utils.task_manager import check_running_tasks, ffmpeg_queue, ffmpeg_queue_lock, active_ffmpeg, start_from_queued
 
 logger = logging.getLogger("TaskListener")
 
@@ -88,7 +88,7 @@ def smart_guess_split(input_file, start_time, target_min, target_max, total_dura
     return best_time if 1_931_069_952 <= best_size <= 2_028_896_563 else None, best_size
 
 class TaskListener(TaskConfig):
-    def __init__(self, mid, message, dir, user_id, tag, user_dict=None):
+    def __init__(self, mid=None, message=None, dir=None, user_id=None, tag=None, user_dict=None):
         super().__init__()
         if not check_dependencies():
             raise Exception("FFmpeg/ffprobe missing. TaskListener cannot proceed.")
@@ -110,7 +110,18 @@ class TaskListener(TaskConfig):
         self.vidMode = None
         self.isGofile = False
         self.seed = True
-        LOGGER.info(f"TaskListener initialized for MID: {self.mid}")
+        if mid:  # Only log if initialized with mid
+            LOGGER.info(f"TaskListener initialized for MID: {self.mid}")
+
+    def set_params(self, mid, message, dir, user_id, tag, user_dict=None):
+        """Set parameters after instantiation if not provided initially."""
+        self.mid = mid
+        self.message = message
+        self.dir = dir
+        self.user_id = user_id
+        self.tag = tag
+        self.user_dict = user_dict or {}
+        LOGGER.info(f"TaskListener parameters set for MID: {self.mid}")
 
     async def clean(self):
         try:
@@ -135,7 +146,7 @@ class TaskListener(TaskConfig):
         return None
 
     async def reName(self):
-        # Basic renaming logic (placeholder, extend as needed)
+        # Placeholder for renaming logic
         pass
 
     async def onDownloadStart(self):
@@ -144,7 +155,7 @@ class TaskListener(TaskConfig):
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
 
     async def onDownloadComplete(self):
-        global active_ffmpeg  # Declare global at the start
+        global active_ffmpeg
         LOGGER.info(f"onDownloadComplete called for MID: {self.mid}")
         multi_links = False
         if self.sameDir and self.mid in self.sameDir.get('tasks', []):
@@ -258,7 +269,7 @@ class TaskListener(TaskConfig):
                 LOGGER.info(f"FFmpeg not active for MID: {self.mid}, cleaning up")
                 await self.clean()
                 return
-            active_ffmpeg = None  # Clear after completion
+            active_ffmpeg = None
 
         add_to_queue, event = await check_running_tasks(self.mid, "up")
         if add_to_queue:

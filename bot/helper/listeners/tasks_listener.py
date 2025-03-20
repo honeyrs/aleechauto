@@ -146,6 +146,7 @@ class TaskListener(TaskConfig):
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
 
     async def onDownloadComplete(self):
+        global active_ffmpeg  # Declare global at the start
         LOGGER.info(f"onDownloadComplete called for MID: {self.mid}")
         multi_links = False
         if self.sameDir and self.mid in self.sameDir.get('tasks', []):
@@ -259,8 +260,7 @@ class TaskListener(TaskConfig):
                 LOGGER.info(f"FFmpeg not active for MID: {self.mid}, cleaning up")
                 await self.clean()
                 return
-            global active_ffmpeg
-            active_ffmpeg = None
+            active_ffmpeg = None  # Clear after completion
 
         add_to_queue, event = await check_running_tasks(self.mid, "up")
         if add_to_queue:
@@ -431,12 +431,10 @@ class TaskListener(TaskConfig):
         await gather(start_from_queued(), clean_download(self.dir))
 
     async def proceedExtract(self, up_path, size, gid):
-        # Basic extract logic (placeholder, extend as needed)
         LOGGER.info(f"Extracting {up_path}")
         return up_path
 
     async def generateSampleVideo(self, up_path, gid):
-        # Basic sample video logic (placeholder, extend as needed)
         LOGGER.info(f"Generating sample for {up_path}")
         sample_path = ospath.join(self.dir, f"sample_{ospath.basename(up_path)}")
         cmd = ['ffmpeg', '-i', up_path, '-t', '60', '-c', 'copy', sample_path, '-y']
@@ -448,7 +446,6 @@ class TaskListener(TaskConfig):
             return None
 
     async def proceedCompress(self, up_path, size, gid):
-        # Basic compress logic (placeholder, extend as needed)
         LOGGER.info(f"Compressing {up_path}")
         compressed_path = ospath.join(self.dir, f"compressed_{ospath.basename(up_path)}")
         cmd = ['ffmpeg', '-i', up_path, '-vf', 'scale=1280:720', '-crf', '28', compressed_path, '-y']

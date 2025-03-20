@@ -135,7 +135,6 @@ class TaskListener(TaskConfig):
         return None
 
     async def reName(self):
-        # Placeholder for renaming logic
         pass
 
     async def onDownloadStart(self):
@@ -248,24 +247,25 @@ class TaskListener(TaskConfig):
         up_dir, self.name = ospath.split(up_path)
         size = await get_path_size(up_path if await aiopath.isfile(up_path) else up_dir)
 
-        # Handle FFmpeg tasks without early exit unless critical
         if ffmpeg_needed:
             event = Event()
             async with ffmpeg_queue_lock:
                 ffmpeg_queue[self.mid] = (event, task_type, up_path)
                 LOGGER.info(f"Queued FFmpeg for MID: {self.mid}, type: {task_type}")
             try:
-                await wait_for(event.wait(), timeout=300)
+                await wait_for(event.wait(), timeout=600)
                 if active_ffmpeg == self.mid:
                     LOGGER.info(f"FFmpeg completed for MID: {self.mid}")
-                    active_ffmpeg = None
+                    async with ffmpeg_queue_lock:
+                        active_ffmpeg = None
                 else:
-                    LOGGER.warning(f"FFmpeg not active for MID: {self.mid}, proceeding to upload anyway")
+                    LOGGER.warning(f"FFmpeg not active for MID: {self.mid}, proceeding to upload")
             except AsyncTimeoutError:
                 LOGGER.error(f"FFmpeg timed out for MID: {self.mid}, proceeding to upload")
-                active_ffmpeg = None
+                async with ffmpeg_queue_lock:
+                    if active_ffmpeg == self.mid:
+                        active_ffmpeg = None
 
-        # Queue upload task
         add_to_queue, event = await check_running_tasks(self.mid, "up")
         if add_to_queue:
             async with task_dict_lock:
@@ -279,7 +279,6 @@ class TaskListener(TaskConfig):
         async with queue_dict_lock:
             non_queued_up.add(self.mid)
 
-        # Proceed to upload
         if self.isLeech:
             upload_path = split_dir if task_type == 'split' else up_path
             tg = TgUploader(self, upload_path, size)
@@ -423,7 +422,8 @@ class TaskListener(TaskConfig):
         if self.isSuperChat and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
         await sendingMessage(f"Download failed: {error}", self.message, None)
-        await gather(start_from_queued(), clean_download(self.dir))
+        await clean_download(self.dir)
+        await start_from_queued()
 
     async def onUploadError(self, error):
         LOGGER.error(f"Upload error: {error}")
@@ -433,7 +433,8 @@ class TaskListener(TaskConfig):
         if self.isSuperChat and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
         await sendingMessage(f"Upload failed: {error}", self.message, None)
-        await gather(start_from_queued(), clean_download(self.dir))
+        await clean_download(self.dir)
+        await start_from_queued()
 
     async def proceedExtract(self, up_path, size, gid):
         LOGGER.info(f"Extracting {up_path}")

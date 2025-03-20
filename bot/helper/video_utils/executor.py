@@ -16,7 +16,6 @@ from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
 from bot.helper.telegram_helper.message_utils import sendMessage
 
 async def get_metavideo(video_file):
-    """Get video metadata using ffprobe."""
     try:
         stdout, stderr, rcode = await cmd_exec(['ffprobe', '-hide_banner', '-print_format', 'json', '-show_streams', video_file])
         if rcode != 0:
@@ -45,7 +44,6 @@ class VidEcxecutor:
         LOGGER.info(f"Initialized VidEcxecutor for MID: {self.listener.mid}, path: {self.path}")
 
     async def _cleanup(self):
-        """Clean up resources after task completion or failure."""
         try:
             for f in self._files:
                 if await aiopath.exists(f):
@@ -68,7 +66,6 @@ class VidEcxecutor:
             LOGGER.error(f"Cleanup error: {e}")
 
     async def _extract_zip(self, zip_path):
-        """Extract ZIP files."""
         extract_dir = ospath.join(ospath.dirname(zip_path), f"extracted_{self.gid}")
         try:
             await makedirs(extract_dir, exist_ok=True)
@@ -87,7 +84,6 @@ class VidEcxecutor:
             return None
 
     async def _get_files(self):
-        """Get list of video files from path."""
         file_list = []
         if self.metadata:
             file_list.append(self.path)
@@ -114,7 +110,6 @@ class VidEcxecutor:
         return file_list
 
     async def execute(self):
-        """Execute FFmpeg task via queue."""
         global active_ffmpeg
         self._is_dir = await aiopath.isdir(self.path)
         try:
@@ -141,43 +136,42 @@ class VidEcxecutor:
             LOGGER.info(f"Queued FFmpeg task for MID: {self.listener.mid}, mode: {self.mode}")
 
         try:
-            await wait_for(event.wait(), timeout=300)
+            await wait_for(event.wait(), timeout=600)  # Increased timeout to ensure FFmpeg completes
+            if active_ffmpeg != self.listener.mid:
+                LOGGER.warning(f"FFmpeg not active for MID: {self.listener.mid}, retrying queue")
+                return await self.execute()  # Retry if not active
         except AsyncTimeoutError:
             LOGGER.error(f"FFmpeg queue timeout for MID: {self.listener.mid}")
             async with ffmpeg_queue_lock:
                 ffmpeg_queue.pop(self.listener.mid, None)
+                if active_ffmpeg == self.listener.mid:
+                    active_ffmpeg = None
             await self._cleanup()
             await self.listener.onUploadError("FFmpeg processing timed out.")
             return None
 
-        if active_ffmpeg == self.listener.mid:
-            try:
-                if self.mode == 'merge_rmaudio':
-                    result = await self._merge_and_rmaudio(file_list)
-                else:
-                    LOGGER.error(f"Unsupported mode: {self.mode}")
-                    result = None
-                if self.is_cancelled or not result:
-                    await self._cleanup()
-                    await self.listener.onUploadError(f"{self.mode} processing failed.")
-                    return None
-                active_ffmpeg = None
-                LOGGER.info(f"FFmpeg completed for MID: {self.listener.mid}")
-                return result
-            except Exception as e:
-                LOGGER.error(f"Execution error in {self.mode} for MID: {self.listener.mid}: {e}")
+        try:
+            if self.mode == 'merge_rmaudio':
+                result = await self._merge_and_rmaudio(file_list)
+            else:
+                LOGGER.error(f"Unsupported mode: {self.mode}")
+                result = None
+            if self.is_cancelled or not result:
                 await self._cleanup()
-                await self.listener.onUploadError(f"Failed to process {self.mode}.")
+                await self.listener.onUploadError(f"{self.mode} processing failed.")
                 return None
-            finally:
-                async with ffmpeg_queue_lock:
-                    ffmpeg_queue.pop(self.listener.mid, None)
-        else:
-            LOGGER.warning(f"FFmpeg not active for MID: {self.listener.mid}, proceeding anyway")
-            return self.path
+            LOGGER.info(f"FFmpeg completed for MID: {self.listener.mid}")
+            async with ffmpeg_queue_lock:
+                if active_ffmpeg == self.listener.mid:
+                    active_ffmpeg = None
+            return result
+        except Exception as e:
+            LOGGER.error(f"Execution error in {self.mode} for MID: {self.listener.mid}: {e}")
+            await self._cleanup()
+            await self.listener.onUploadError(f"Failed to process {self.mode}.")
+            return None
 
     async def _send_status(self, status='wait'):
-        """Send FFmpeg status update."""
         try:
             async with task_dict_lock:
                 if self.listener.mid in task_dict:
@@ -186,7 +180,6 @@ class VidEcxecutor:
             LOGGER.error(f"Failed to send status: {e}")
 
     async def _final_path(self, outfile=''):
-        """Determine final output path and clean up."""
         try:
             if self.metadata:
                 self._up_path = outfile or self.outfile
@@ -209,7 +202,6 @@ class VidEcxecutor:
             return None
 
     async def _name_base_dir(self, path, info: str=None, multi: bool=False):
-        """Generate output file name and base directory."""
         base_dir, file_name = ospath.split(path)
         if not self.name or multi:
             if info:
@@ -224,7 +216,6 @@ class VidEcxecutor:
         return base_dir if await aiopath.isfile(path) else path
 
     async def _run_cmd(self, cmd, status='prog'):
-        """Run FFmpeg command."""
         try:
             await self._send_status(status)
             LOGGER.info(f"Running FFmpeg cmd: {' '.join(cmd)}")
@@ -248,7 +239,6 @@ class VidEcxecutor:
             return False
 
     async def _merge_and_rmaudio(self, file_list):
-        """Merge files and remove audio streams."""
         streams = await get_metavideo(file_list[0])
         if not streams:
             LOGGER.error(f"No streams found in {file_list[0]}")

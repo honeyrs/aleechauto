@@ -6,20 +6,17 @@ from bot.helper.ext_utils.links_utils import is_gdrive_id, is_mega_link
 from bot.helper.mirror_utils.gdrive_utlis.search import gdSearch
 from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
 
-# Queue structures
-non_queued_dl = set()  # Active downloads
-queued_dl = {}        # Waiting downloads (MID -> Event)
-non_queued_up = set()  # Active uploads
-queued_up = {}        # Waiting uploads (MID -> Event)
-ffmpeg_queue = {}     # Waiting FFmpeg tasks (MID -> (Event, task_type, file_details))
-active_ffmpeg = None  # Current FFmpeg task MID
+non_queued_dl = set()
+queued_dl = {}
+non_queued_up = set()
+queued_up = {}
+ffmpeg_queue = {}
+active_ffmpeg = None
 
-# Locks for each queue
-queue_dict_lock = Lock()      # Downloads and uploads
-ffmpeg_queue_lock = Lock()    # FFmpeg
+queue_dict_lock = Lock()
+ffmpeg_queue_lock = Lock()
 
 async def stop_duplicate_check(listener):
-    """Check for duplicate files in Google Drive."""
     if (isinstance(listener.upDest, int) or listener.isLeech or listener.select or listener.sameDir
         or not is_gdrive_id(listener.upDest) or not listener.stopDuplicate):
         return None, ''
@@ -43,7 +40,6 @@ async def stop_duplicate_check(listener):
     return None, ''
 
 async def check_limits_size(listener, size, playlist=False, play_count=False):
-    """Check size and playlist limits."""
     msgerr = None
     max_pyt, megadl, torddl, zuzdl, leechdl, storage = (
         config_dict['MAX_YTPLAYLIST'], config_dict['MEGA_LIMIT'], config_dict['TORRENT_DIRECT_LIMIT'],
@@ -72,10 +68,9 @@ async def check_limits_size(listener, size, playlist=False, play_count=False):
     return msgerr
 
 async def check_running_tasks(mid: int, state='dl'):
-    """Check if task can start; queue if limits hit."""
     all_limit = config_dict.get('QUEUE_ALL', 0)
-    dl_limit = config_dict.get('QUEUE_DOWNLOAD', 0) or 0  # Unlimited if not set
-    up_limit = config_dict.get('QUEUE_UPLOAD', 0) or 1   # Default 1 upload
+    dl_limit = config_dict.get('QUEUE_DOWNLOAD', 0) or 0
+    up_limit = config_dict.get('QUEUE_UPLOAD', 0) or 1
     event = None
     is_over_limit = False
     target_non_queued = non_queued_dl if state == 'dl' else non_queued_up
@@ -98,7 +93,6 @@ async def check_running_tasks(mid: int, state='dl'):
     return is_over_limit, event
 
 async def start_dl_from_queued(mid: int):
-    """Release a download from queue."""
     async with queue_dict_lock:
         if mid in queued_dl:
             LOGGER.info(f"Releasing queued download task MID: {mid}")
@@ -110,7 +104,6 @@ async def start_dl_from_queued(mid: int):
     await sleep(0.5)
 
 async def start_up_from_queued(mid: int):
-    """Release an upload from queue."""
     async with queue_dict_lock:
         if mid in queued_up:
             LOGGER.info(f"Releasing queued upload task MID: {mid}")
@@ -125,7 +118,6 @@ async def start_up_from_queued(mid: int):
     await sleep(0.5)
 
 async def start_task_from_queued(task_type, limit, non_queued, queued):
-    """Start tasks from queue based on limit."""
     async with queue_dict_lock:
         count = len(non_queued)
         if not queued:
@@ -145,7 +137,6 @@ async def start_task_from_queued(task_type, limit, non_queued, queued):
             LOGGER.info(f"{task_type} limit reached: {count}/{limit}")
 
 async def run_ffmpeg_manager():
-    """Manage FFmpeg queue - 1 task at a time."""
     global active_ffmpeg
     while True:
         try:
@@ -162,7 +153,6 @@ async def run_ffmpeg_manager():
             await sleep(5)
 
 async def run_upload_manager():
-    """Manage upload queue - 1 task at a time."""
     while True:
         try:
             async with queue_dict_lock:
@@ -177,7 +167,6 @@ async def run_upload_manager():
             await sleep(5)
 
 async def start_from_queued():
-    """Start tasks from download and upload queues."""
     all_limit = config_dict.get('QUEUE_ALL', 0)
     dl_limit = config_dict.get('QUEUE_DOWNLOAD', 0) or 0
     up_limit = config_dict.get('QUEUE_UPLOAD', 0) or 1
@@ -192,6 +181,5 @@ async def start_from_queued():
     await start_task_from_queued('up', up_limit, non_queued_up, queued_up)
     await start_task_from_queued('dl', dl_limit, non_queued_dl, queued_dl)
 
-# Start managers
 bot_loop.create_task(run_ffmpeg_manager())
 bot_loop.create_task(run_upload_manager())

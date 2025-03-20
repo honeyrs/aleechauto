@@ -255,7 +255,7 @@ class TaskListener(TaskConfig):
                 ffmpeg_queue[self.mid] = (event, task_type, up_path)
                 LOGGER.info(f"Queued FFmpeg for MID: {self.mid}, type: {task_type}")
             try:
-                await wait_for(event.wait(), timeout=300)  # 5-minute timeout
+                await wait_for(event.wait(), timeout=300)
                 if active_ffmpeg == self.mid:
                     LOGGER.info(f"FFmpeg completed for MID: {self.mid}")
                     active_ffmpeg = None
@@ -421,7 +421,7 @@ class TaskListener(TaskConfig):
             task_dict.pop(self.mid, None)
         await self.clean()
         if self.isSuperChat and DATABASE_URL:
-            await DbManager().rm_complete_task(self.message.link, Debian)
+            await DbManager().rm_complete_task(self.message.link)
         await sendingMessage(f"Download failed: {error}", self.message, None)
         await gather(start_from_queued(), clean_download(self.dir))
 

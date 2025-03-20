@@ -3,8 +3,6 @@ from aioshutil import move
 from asyncio import sleep, gather, wait_for, TimeoutError as AsyncTimeoutError, Event
 from html import escape
 from os import walk, path as ospath
-from random import choice
-from time import time
 import subprocess
 import math
 import logging
@@ -28,7 +26,7 @@ from bot.helper.mirror_utils.upload_utils.telegram_uploader import TgUploader
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import sendingMessage, update_status_message, delete_status
 from bot.helper.video_utils.executor import VidEcxecutor
-from .task_manager import check_running_tasks, ffmpeg_queue, ffmpeg_queue_lock, active_ffmpeg, start_from_queued
+from bot.helper.ext_utils.task_manager import check_running_tasks, ffmpeg_queue, ffmpeg_queue_lock, active_ffmpeg, start_from_queued  # Corrected import
 
 logger = logging.getLogger("TaskListener")
 

@@ -11,7 +11,7 @@ from bot import task_dict, task_dict_lock, LOGGER, VID_MODE, FFMPEG_NAME, bot
 from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target, clean_download
 from bot.helper.ext_utils.media_utils import get_document_type
-from bot.helper.ext_utils.task_manager import ffmpeg_queue, ffmpeg_queue_lock, active_ffmpeg, non_queued_up, queue_dict_lock, start_from_queued  # Corrected import
+from bot.helper.ext_utils.task_manager import ffmpeg_queue, ffmpeg_queue_lock, active_ffmpeg, non_queued_up, queue_dict_lock, start_from_queued
 from bot.helper.mirror_utils.status_utils.ffmpeg_status import FFMpegStatus
 from bot.helper.telegram_helper.message_utils import sendMessage
 
@@ -141,7 +141,7 @@ class VidEcxecutor:
             LOGGER.info(f"Queued FFmpeg task for MID: {self.listener.mid}, mode: {self.mode}")
 
         try:
-            await wait_for(event.wait(), timeout=300)  # 5-minute timeout
+            await wait_for(event.wait(), timeout=300)
         except AsyncTimeoutError:
             LOGGER.error(f"FFmpeg queue timeout for MID: {self.listener.mid}")
             async with ffmpeg_queue_lock:
@@ -173,9 +173,8 @@ class VidEcxecutor:
                 async with ffmpeg_queue_lock:
                     ffmpeg_queue.pop(self.listener.mid, None)
         else:
-            LOGGER.info(f"FFmpeg not active for MID: {self.listener.mid}, skipped")
-            await self._cleanup()
-            return None
+            LOGGER.warning(f"FFmpeg not active for MID: {self.listener.mid}, proceeding anyway")
+            return self.path
 
     async def _send_status(self, status='wait'):
         """Send FFmpeg status update."""

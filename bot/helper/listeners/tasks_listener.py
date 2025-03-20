@@ -248,18 +248,24 @@ class TaskListener(TaskConfig):
         up_dir, self.name = ospath.split(up_path)
         size = await get_path_size(up_path if await aiopath.isfile(up_path) else up_dir)
 
-        if ffmpeg_needed and task_type not in ['extract', 'sample', 'compress', 'split'] and not self.vidMode:
+        # Handle FFmpeg tasks without early exit unless critical
+        if ffmpeg_needed:
             event = Event()
             async with ffmpeg_queue_lock:
                 ffmpeg_queue[self.mid] = (event, task_type, up_path)
                 LOGGER.info(f"Queued FFmpeg for MID: {self.mid}, type: {task_type}")
-            await event.wait()
-            if active_ffmpeg != self.mid:
-                LOGGER.info(f"FFmpeg not active for MID: {self.mid}, cleaning up")
-                await self.clean()
-                return
-            active_ffmpeg = None
+            try:
+                await wait_for(event.wait(), timeout=300)  # 5-minute timeout
+                if active_ffmpeg == self.mid:
+                    LOGGER.info(f"FFmpeg completed for MID: {self.mid}")
+                    active_ffmpeg = None
+                else:
+                    LOGGER.warning(f"FFmpeg not active for MID: {self.mid}, proceeding to upload anyway")
+            except AsyncTimeoutError:
+                LOGGER.error(f"FFmpeg timed out for MID: {self.mid}, proceeding to upload")
+                active_ffmpeg = None
 
+        # Queue upload task
         add_to_queue, event = await check_running_tasks(self.mid, "up")
         if add_to_queue:
             async with task_dict_lock:
@@ -273,6 +279,7 @@ class TaskListener(TaskConfig):
         async with queue_dict_lock:
             non_queued_up.add(self.mid)
 
+        # Proceed to upload
         if self.isLeech:
             upload_path = split_dir if task_type == 'split' else up_path
             tg = TgUploader(self, upload_path, size)
@@ -283,7 +290,7 @@ class TaskListener(TaskConfig):
                 if files_dict:
                     await self.onUploadComplete(None, size, files_dict, len(o_files) if task_type == 'split' else 1, 0)
             except AsyncTimeoutError:
-                await self.onUploadError("Upload timed out after 10 minutes.")
+                await self.onUploadError("Upload timed out after 60 minutes.")
                 return
             except Exception as e:
                 await self.onUploadError(f"Upload failed: {str(e)}")
@@ -414,7 +421,7 @@ class TaskListener(TaskConfig):
             task_dict.pop(self.mid, None)
         await self.clean()
         if self.isSuperChat and DATABASE_URL:
-            await DbManager().rm_complete_task(self.message.link)
+            await DbManager().rm_complete_task(self.message.link Debian)
         await sendingMessage(f"Download failed: {error}", self.message, None)
         await gather(start_from_queued(), clean_download(self.dir))
 

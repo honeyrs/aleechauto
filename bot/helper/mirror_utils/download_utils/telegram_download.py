@@ -1,4 +1,3 @@
-from __future__ import annotations
 from asyncio import Lock, gather
 from logging import getLogger, ERROR
 from os import path as ospath
@@ -9,30 +8,26 @@ from bot import bot, task_dict, task_dict_lock, non_queued_dl, queue_dict_lock, 
 from bot.helper.ext_utils.links_utils import is_media
 from bot.helper.ext_utils.status_utils import get_readable_file_size
 from bot.helper.ext_utils.task_manager import check_running_tasks, stop_duplicate_check, check_limits_size
-from bot.helper.listeners import tasks_listener as task
 from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
 from bot.helper.mirror_utils.status_utils.telegram_status import TelegramStatus
 from bot.helper.telegram_helper.message_utils import sendStatusMessage
-
 
 global_lock = Lock()
 GLOBAL_GID = set()
 getLogger('pyrogram').setLevel(ERROR)
 
-
 class TelegramDownloadHelper:
-
-    def __init__(self, listener: task.TaskListener):
+    def __init__(self, listener):
         self._processed_bytes = 0
         self._start_time = time()
         self._listener = listener
         self._id = ''
         self._is_cancelled = False
-        self._client: Client = bot
+        self._client = bot
 
     @property
     def speed(self):
-        return self._processed_bytes / (time() - self._start_time)
+        return self._processed_bytes / max(time() - self._start_time, 1)
 
     @property
     def processed_bytes(self):
@@ -50,9 +45,9 @@ class TelegramDownloadHelper:
             await self._listener.onDownloadStart()
             if self._listener.multi <= 1:
                 await sendStatusMessage(self._listener.message)
-            LOGGER.info('Download from Telegram: %s', self._listener.name)
+            LOGGER.info(f"Download from Telegram: {self._listener.name}")
         else:
-            LOGGER.info('Start Queued Download from Telegram: %s', self._listener.name)
+            LOGGER.info(f"Start Queued Download from Telegram: {self._listener.name}")
 
     async def _onDownloadProgress(self, current, total):
         if self._is_cancelled:
@@ -62,40 +57,46 @@ class TelegramDownloadHelper:
 
     async def _onDownloadError(self, error, listfile=None):
         async with global_lock:
-            try:
+            if self._id in GLOBAL_GID:
                 GLOBAL_GID.remove(self._id)
-            except:
-                pass
         await self._listener.onDownloadError(error, listfile)
+        async with queue_dict_lock:
+            non_queued_dl.discard(self._listener.mid)
 
     async def _onDownloadComplete(self):
         await self._listener.onDownloadComplete()
         async with global_lock:
-            GLOBAL_GID.remove(self._id)
+            if self._id in GLOBAL_GID:
+                GLOBAL_GID.remove(self._id)
+        async with queue_dict_lock:
+            non_queued_dl.discard(self._listener.mid)
 
     async def _download(self, message, path):
         try:
-            download = await self._client.download_media(message, file_name=path, progress=self._onDownloadProgress)
+            download = await self._client.download_media(
+                message=message,
+                file_name=path,
+                progress=self._onDownloadProgress
+            )
             if self._is_cancelled:
                 return
+            if download:
+                self._listener.name = ospath.basename(download)
+                await self._onDownloadComplete()
+            elif not self._is_cancelled:
+                await self._onDownloadError('Internal error occurred')
         except Exception as e:
-            LOGGER.error(e)
-            self._onDownloadError(str(e))
-            return
-        if download:
-            await self._onDownloadComplete()
-        elif not self._is_cancelled:
-            await self._onDownloadError('Internal error occurred')
+            LOGGER.error(f"Download error: {e}")
+            await self._onDownloadError(str(e))
 
     async def add_download(self, message, path):
         if self._listener.session and self._listener.session != bot:
             self._client = self._listener.session
         if media := is_media(message):
             async with global_lock:
-                # For avoiding locking the thread lock for long time unnecessarily
                 download = media.file_unique_id not in GLOBAL_GID
             if download:
-                if self._listener.name == '':
+                if not self._listener.name:
                     self._listener.name = getattr(media, 'file_name', media.file_unique_id) or media.file_unique_id
                 path = ospath.join(path, self._listener.name)
                 size = media.file_size
@@ -115,7 +116,7 @@ class TelegramDownloadHelper:
 
                 add_to_queue, event = await check_running_tasks(self._listener.mid)
                 if add_to_queue:
-                    LOGGER.info('Added to Queue/Download: %s', self._listener.name)
+                    LOGGER.info(f"Added to Queue/Download: {self._listener.name}")
                     async with task_dict_lock:
                         task_dict[self._listener.mid] = QueueStatus(self._listener, size, gid, 'dl')
                     await gather(self._listener.onDownloadStart(), sendStatusMessage(self._listener.message), event.wait())
@@ -126,7 +127,7 @@ class TelegramDownloadHelper:
                 else:
                     from_queue = False
                 await self._onDownloadStart(size, gid, from_queue)
-                LOGGER.info('Downloading Telegram file with id: %s', gid)
+                LOGGER.info(f"Downloading Telegram file with id: {gid}")
                 await self._download(message, path)
             else:
                 await self._onDownloadError('File already being downloaded!')
@@ -135,5 +136,5 @@ class TelegramDownloadHelper:
 
     async def cancel_task(self):
         self._is_cancelled = True
-        LOGGER.info('Cancelling download on user request: name: %s id: %s', self._listener.name, self._id)
+        LOGGER.info(f"Cancelling download on user request: name: {self._listener.name} id: {self._id}")
         await self._onDownloadError('Download cancelled by user!')

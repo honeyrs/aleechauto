@@ -1,12 +1,6 @@
-from aiofiles.os import path as aiopath
-from asyncio import Event, Lock, sleep
-from os import path as ospath
-
-from bot import config_dict, bot_loop, LOGGER
-from bot.helper.ext_utils.bot_utils import sync_to_async, presuf_remname_name, is_premium_user
-from bot.helper.ext_utils.files_utils import get_base_name, check_storage_threshold
-from bot.helper.ext_utils.links_utils import is_gdrive_id, is_mega_link
-from bot.helper.mirror_utils.gdrive_utlis.search import gdSearch
+from asyncio import sleep, Event, Lock
+from bot import config_dict, bot_loop, LOGGER, task_dict, task_dict_lock
+from bot.helper.mirror_utils.status_utils.queue_status import QueueStatus
 
 # Queue structures
 non_queued_dl = set()  # Active downloads
@@ -17,8 +11,7 @@ ffmpeg_queue = {}     # Waiting FFmpeg tasks (MID -> (Event, task_type, file_det
 active_ffmpeg = None  # Current FFmpeg task MID
 
 # Locks for each queue
-queue_dict_lock = Lock()      # Downloads
-upload_queue_lock = Lock()    # Uploads
+queue_dict_lock = Lock()      # Downloads and uploads
 ffmpeg_queue_lock = Lock()    # FFmpeg
 
 async def stop_duplicate_check(listener):
@@ -76,15 +69,16 @@ async def check_limits_size(listener, size, playlist=False, play_count=False):
 
 async def check_running_tasks(mid: int, state='dl'):
     """Check if task can start; queue if limits hit."""
-    all_limit = config_dict.get('QUEUE_ALL', 0)  # Overall limit
-    state_limit = 0 if state == 'dl' else 1  # Downloads unlimited, uploads 1
+    all_limit = config_dict.get('QUEUE_ALL', 0)
+    dl_limit = config_dict.get('QUEUE_DOWNLOAD', 0) or 0  # Unlimited if not set
+    up_limit = config_dict.get('QUEUE_UPLOAD', 0) or 1   # Default 1 upload
     event = None
     is_over_limit = False
-    target_lock = queue_dict_lock if state == 'dl' else upload_queue_lock
     target_non_queued = non_queued_dl if state == 'dl' else non_queued_up
     target_queued = queued_dl if state == 'dl' else queued_up
-    
-    async with target_lock:
+    state_limit = dl_limit if state == 'dl' else up_limit
+
+    async with queue_dict_lock:
         if state == 'up' and mid in non_queued_dl:
             non_queued_dl.remove(mid)
             LOGGER.info(f"Removed MID {mid} from non_queued_dl for upload")
@@ -113,20 +107,22 @@ async def start_dl_from_queued(mid: int):
 
 async def start_up_from_queued(mid: int):
     """Release an upload from queue."""
-    async with upload_queue_lock:
+    async with queue_dict_lock:
         if mid in queued_up:
             LOGGER.info(f"Releasing queued upload task MID: {mid}")
             queued_up[mid].set()
             del queued_up[mid]
             non_queued_up.add(mid)
+            async with task_dict_lock:
+                if mid in task_dict and hasattr(task_dict[mid], 'listener'):
+                    await task_dict[mid].listener.onDownloadComplete()
         else:
             LOGGER.warning(f"MID {mid} not found in queued_up")
     await sleep(0.5)
 
 async def start_task_from_queued(task_type, limit, non_queued, queued):
     """Start tasks from queue based on limit."""
-    target_lock = queue_dict_lock if task_type == 'dl' else upload_queue_lock
-    async with target_lock:
+    async with queue_dict_lock:
         count = len(non_queued)
         if not queued:
             LOGGER.info(f"No {task_type} tasks in queue to start")
@@ -155,17 +151,17 @@ async def run_ffmpeg_manager():
                     active_ffmpeg = mid
                     LOGGER.info(f"Starting FFmpeg for MID: {mid}, type: {task_type}")
                     del ffmpeg_queue[mid]
-                    event.set()  # Signal VidEcxecutor or TaskListener to proceed
+                    event.set()
             await sleep(1)
         except Exception as e:
             LOGGER.error(f"FFmpeg manager error: {e}")
-            await sleep(5)  # Prevent tight loop on error
+            await sleep(5)
 
 async def run_upload_manager():
     """Manage upload queue - 1 task at a time."""
     while True:
         try:
-            async with upload_queue_lock:
+            async with queue_dict_lock:
                 up_count = len(non_queued_up)
                 if up_count < 1 and queued_up:
                     mid = next(iter(queued_up))
@@ -179,8 +175,8 @@ async def run_upload_manager():
 async def start_from_queued():
     """Start tasks from download and upload queues."""
     all_limit = config_dict.get('QUEUE_ALL', 0)
-    dl_limit = 0  # Unlimited downloads
-    up_limit = 1  # 1 upload at a time
+    dl_limit = config_dict.get('QUEUE_DOWNLOAD', 0) or 0
+    up_limit = config_dict.get('QUEUE_UPLOAD', 0) or 1
     LOGGER.info(f"start_from_queued called - all_limit: {all_limit}, dl_limit: {dl_limit}, up_limit: {up_limit}")
     async with queue_dict_lock:
         dl_count, up_count = len(non_queued_dl), len(non_queued_up)

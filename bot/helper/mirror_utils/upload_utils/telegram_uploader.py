@@ -7,13 +7,14 @@ from natsort import natsorted
 from os import path as ospath, walk
 from random import randrange
 from time import time
+import subprocess
 
 from bot import task_dict, task_dict_lock, LOGGER, config_dict, non_queued_up, queue_dict_lock, bot
 from bot.helper.ext_utils.bot_utils import sync_to_async
 from bot.helper.ext_utils.files_utils import get_path_size, clean_target
 from bot.helper.ext_utils.links_utils import is_gdrive_link
-from bot.helper.ext_utils.media_utils import get_document_type, take_ss, get_video_resolution
-from bot.helper.ext_utils.status_utils import get_readable_time  # Corrected import
+from bot.helper.ext_utils.media_utils import get_document_type, take_ss
+from bot.helper.ext_utils.status_utils import get_readable_time
 from bot.helper.mirror_utils.status_utils.telegram_status import TelegramStatus
 from bot.helper.telegram_helper.button_build import ButtonMaker
 from bot.helper.telegram_helper.message_utils import sendMessage, editMessage, sendFile
@@ -47,6 +48,16 @@ class TgUploader:
     def total_size(self):
         return self._total_files * self._size
 
+    async def _get_duration(self, file_path):
+        """Get video duration using ffprobe."""
+        try:
+            cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            return int(float(result.stdout.strip()))
+        except Exception as e:
+            LOGGER.error(f"Failed to get duration for {file_path}: {e}")
+            return 0
+
     async def _gen_thumb(self, video_file, duration):
         thumb_path = ospath.join(self._path, f'thumb_{self._listener.mid}.jpg')
         try:
@@ -73,7 +84,7 @@ class TgUploader:
             if file_size > split_size:
                 base_name = ospath.splitext(file_)[0]
                 parts = ceil(file_size / split_size)
-                duration = (await get_video_resolution(file_))[2] if is_video else 0
+                duration = await self._get_duration(file_) if is_video else 0
                 self._thumb = await self._gen_thumb(file_, duration) if is_video and not self._thumb else self._thumb
 
                 for i in range(parts):
@@ -94,7 +105,7 @@ class TgUploader:
                     await self._send_part(part_file, is_video, duration, i + 1, parts)
                     await aioremove(part_file)
             else:
-                duration = (await get_video_resolution(file_))[2] if is_video else 0
+                duration = await self._get_duration(file_) if is_video else 0
                 self._thumb = await self._gen_thumb(file_, duration) if is_video and not self._thumb else self._thumb
                 await self._send_part(file_, is_video, duration, 1 if multi_files else None, None)
 

@@ -30,7 +30,6 @@ from bot.helper.telegram_helper.message_utils import sendMessage, deleteMessage,
 from bot.helper.video_utils.selector import SelectMode
 from myjd.exception import MYJDException
 
-
 class Mirror(TaskListener):
     def __init__(self, client: Client, message: Message, isQbit=False, isJd=False, isLeech=False, vidMode=None, sameDir=None, bulk=None, multiTag=None, options=''):
         if sameDir is None:
@@ -43,14 +42,22 @@ class Mirror(TaskListener):
         self.options = options
         self.sameDir = sameDir
         self.bulk = bulk
-        super().__init__()
+        # Pass required args to TaskListener
+        mid = f"{message.id}_{message.chat.id}"
+        user_id = message.from_user.id if message.from_user else 0
+        tag = message.from_user.username if message.from_user else "Anonymous"
+        super().__init__(mid=mid, message=message, dir=config_dict.get('DOWNLOAD_DIR', '/usr/src/app/downloads/'), user_id=user_id, tag=tag)
         self.isQbit = isQbit
         self.isLeech = isLeech
         self.vidMode = vidMode
         self.isJd = isJd
+        LOGGER.info(f"Mirror initialized for MID: {self.mid}")
 
     @new_task
     async def newEvent(self):
+        if not self.message:
+            LOGGER.error(f"Task {self.mid} has no message object")
+            return
         text = self.message.text.split('\n')
         await self.getTag(text)
 
@@ -202,8 +209,6 @@ class Mirror(TaskListener):
         if not is_url(self.link) and not is_magnet(self.link) and not await aiopath.exists(self.link) and not is_rclone_path(self.link) and not is_gdrive_id(self.link) and not file_:
             await gather(editMessage(f'Where Are Links/Files, type /{BotCommands.HelpCommand} for more details.', self.editable), auto_delete_message(self.message, self.editable))
             self.removeFromSameDir()
-
-
             return
 
         if self.link:
@@ -276,7 +281,6 @@ class Mirror(TaskListener):
             await add_rclone_download(self, path)
         elif is_gdrive_link(self.link) or is_gdrive_id(self.link):
             await add_gd_download(self, path)
-        
         elif self.isQbit:
             await add_qb_torrent(self, path, ratio, seed_time)
         else:
@@ -288,30 +292,23 @@ class Mirror(TaskListener):
                 headers = 'Referer: https://www.romsget.io/'
             await add_aria2c_download(self, path, headers, ratio, seed_time)
 
-
 async def mirror(client: Client, message: Message):
     Mirror(client, message).newEvent()
-
 
 async def qb_mirror(client: Client, message: Message):
     Mirror(client, message, isQbit=True).newEvent()
 
-
 async def leech(client: Client, message: Message):
     Mirror(client, message, isLeech=True).newEvent()
-
 
 async def qb_leech(client: Client, message: Message):
     Mirror(client, message, isQbit=True, isLeech=True).newEvent()
 
-
 async def jd_mirror(client: Client, message: Message):
     Mirror(client, message, isJd=True).newEvent()
 
-
 async def jd_leech(client: Client, message: Message):
     Mirror(client, message, isLeech=True, isJd=True).newEvent()
-
 
 bot.add_handler(MessageHandler(mirror, filters=command(BotCommands.MirrorCommand) & CustomFilters.authorized))
 bot.add_handler(MessageHandler(qb_mirror, filters=command(BotCommands.QbMirrorCommand) & CustomFilters.authorized))

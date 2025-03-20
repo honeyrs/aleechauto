@@ -88,7 +88,7 @@ def smart_guess_split(input_file, start_time, target_min, target_max, total_dura
     return best_time if 1_931_069_952 <= best_size <= 2_028_896_563 else None, best_size
 
 class TaskListener(TaskConfig):
-    def __init__(self, mid=None, message=None, dir=None, user_id=None, tag=None, user_dict=None):
+    def __init__(self, mid, message, dir, user_id, tag, user_dict=None):
         super().__init__()
         if not check_dependencies():
             raise Exception("FFmpeg/ffprobe missing. TaskListener cannot proceed.")
@@ -110,8 +110,7 @@ class TaskListener(TaskConfig):
         self.vidMode = None
         self.isGofile = False
         self.seed = True
-        if mid and message:  # Only log if critical params are provided
-            LOGGER.info(f"TaskListener initialized for MID: {self.mid}")
+        LOGGER.info(f"TaskListener initialized for MID: {self.mid}")
 
     async def clean(self):
         try:
@@ -140,18 +139,12 @@ class TaskListener(TaskConfig):
         pass
 
     async def onDownloadStart(self):
-        if not self.mid or not self.message:
-            LOGGER.error("onDownloadStart called with incomplete initialization")
-            return
         LOGGER.info(f"Download started for MID: {self.mid}")
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
 
     async def onDownloadComplete(self):
         global active_ffmpeg
-        if not self.mid or not self.message:
-            LOGGER.error("onDownloadComplete called with incomplete initialization")
-            return
         LOGGER.info(f"onDownloadComplete called for MID: {self.mid}")
         multi_links = False
         if self.sameDir and self.mid in self.sameDir.get('tasks', []):
@@ -392,9 +385,6 @@ class TaskListener(TaskConfig):
         return True
 
     async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):
-        if not self.mid or not self.message:
-            LOGGER.error("onUploadComplete called with incomplete initialization")
-            return
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
 
@@ -419,9 +409,6 @@ class TaskListener(TaskConfig):
         await start_from_queued()
 
     async def onDownloadError(self, error):
-        if not self.mid or not self.message:
-            LOGGER.error("onDownloadError called with incomplete initialization")
-            return
         LOGGER.error(f"Download error: {error}")
         async with task_dict_lock:
             task_dict.pop(self.mid, None)
@@ -432,9 +419,6 @@ class TaskListener(TaskConfig):
         await gather(start_from_queued(), clean_download(self.dir))
 
     async def onUploadError(self, error):
-        if not self.mid or not self.message:
-            LOGGER.error("onUploadError called with incomplete initialization")
-            return
         LOGGER.error(f"Upload error: {error}")
         async with task_dict_lock:
             task_dict.pop(self.mid, None)

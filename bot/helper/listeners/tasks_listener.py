@@ -31,6 +31,7 @@ from bot.helper.ext_utils.task_manager import check_running_tasks, ffmpeg_queue,
 logger = logging.getLogger("TaskListener")
 
 def check_dependencies():
+    """Check if FFmpeg and ffprobe are installed."""
     for cmd in ['ffmpeg', 'ffprobe']:
         try:
             subprocess.run([cmd, '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -40,6 +41,7 @@ def check_dependencies():
     return True
 
 def get_file_size(file_path):
+    """Get the size of a file, return 0 if inaccessible."""
     try:
         return ospath.getsize(file_path)
     except OSError as e:
@@ -47,6 +49,7 @@ def get_file_size(file_path):
         return 0
 
 def get_video_info(file_path):
+    """Retrieve duration and bitrate of a video file."""
     try:
         cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
@@ -58,6 +61,7 @@ def get_video_info(file_path):
         return None
 
 def smart_guess_split(input_file, start_time, target_min, target_max, total_duration, max_iterations=5):
+    """Smartly guess split duration to fit target size range."""
     bytes_per_second = get_file_size(input_file) / total_duration
     guess = target_max / bytes_per_second
     low, high = guess * 0.95, min(total_duration - start_time, guess * 1.05)
@@ -69,13 +73,13 @@ def smart_guess_split(input_file, start_time, target_min, target_max, total_dura
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
             size = get_file_size(temp_file)
-            aioremove(temp_file)
+            await aioremove(temp_file)
             logger.info(f"Smart Iter {i+1}: {mid:.2f}s, {size / (1024*1024*1024):.2f} GB")
-            if 1_931_069_952 <= size <= 2_028_896_563:
+            if target_min <= size <= target_max:
                 return mid, size
-            elif size > 2_028_896_563:
+            elif size > target_max:
                 high = mid
-            elif size < 1_931_069_952:
+            elif size < target_min:
                 low = mid
             best_time, best_size = mid, size
             if high - low < 2.0:
@@ -83,12 +87,13 @@ def smart_guess_split(input_file, start_time, target_min, target_max, total_dura
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
             logger.error(f"Smart guess failed: {e}")
             if ospath.exists(temp_file):
-                aioremove(temp_file)
+                await aioremove(temp_file)
             return None, None
-    return best_time if 1_931_069_952 <= best_size <= 2_028_896_563 else None, best_size
+    return best_time if target_min <= best_size <= target_max else None, best_size
 
 class TaskListener(TaskConfig):
     def __init__(self, mid, message, dir, user_id, tag, user_dict=None):
+        """Initialize TaskListener with required arguments."""
         super().__init__()
         if not check_dependencies():
             raise Exception("FFmpeg/ffprobe missing. TaskListener cannot proceed.")
@@ -113,6 +118,7 @@ class TaskListener(TaskConfig):
         LOGGER.info(f"TaskListener initialized for MID: {self.mid}")
 
     async def clean(self):
+        """Clean up intervals and aria2 tasks."""
         try:
             if st := Intervals.get('status', {}):
                 for intvl in list(st.values()):
@@ -124,29 +130,43 @@ class TaskListener(TaskConfig):
             LOGGER.error(f"Error during cleanup: {e}")
 
     def removeFromSameDir(self):
-        if self.sameDir and self.mid in self.sameDir.get('tasks', []):
+        """Remove task from sameDir set if applicable."""
+        if self.sameDir and self.mid in self.sameDir.get('tasks', set()):
             self.sameDir['tasks'].remove(self.mid)
             self.sameDir['total'] -= 1
             LOGGER.info(f"Removed MID {self.mid} from sameDir")
 
     async def isOneFile(self, path):
+        """Check if path is a single file."""
         if await aiopath.isfile(path):
             return path
         return None
 
     async def reName(self):
-        pass
+        """Rename the file if isRename is set (e.g., from Mirror)."""
+        if hasattr(self, 'isRename') and self.isRename and await aiopath.exists(self.dir):
+            old_path = ospath.join(self.dir, self.name)
+            new_path = ospath.join(self.dir, self.isRename)
+            if old_path != new_path and await aiopath.exists(old_path):
+                try:
+                    await move(old_path, new_path)
+                    self.name = self.isRename
+                    LOGGER.info(f"Renamed {old_path} to {new_path}")
+                except Exception as e:
+                    LOGGER.error(f"Failed to rename {old_path} to {new_path}: {e}")
 
     async def onDownloadStart(self):
+        """Handle download start event."""
         LOGGER.info(f"Download started for MID: {self.mid}")
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
 
     async def onDownloadComplete(self):
+        """Handle download completion and prepare for upload."""
         global active_ffmpeg
         LOGGER.info(f"onDownloadComplete called for MID: {self.mid}")
         multi_links = False
-        if self.sameDir and self.mid in self.sameDir.get('tasks', []):
+        if self.sameDir and self.mid in self.sameDir.get('tasks', set()):
             LOGGER.info(f"Waiting for sameDir tasks for MID: {self.mid}, total: {self.sameDir['total']}")
             while not (self.sameDir['total'] in [1, 0] or (self.sameDir['total'] > 1 and len(self.sameDir['tasks']) > 1)):
                 await sleep(0.5)
@@ -155,7 +175,7 @@ class TaskListener(TaskConfig):
             if self.mid not in task_dict:
                 LOGGER.error(f"Task {self.mid} not found in task_dict")
                 return
-            if self.sameDir and self.sameDir.get('total', 0) > 1 and self.mid in self.sameDir.get('tasks', []):
+            if self.sameDir and self.sameDir.get('total', 0) > 1 and self.mid in self.sameDir.get('tasks', set()):
                 self.sameDir['tasks'].remove(self.mid)
                 self.sameDir['total'] -= 1
                 folder_name = self.sameDir['name']
@@ -186,7 +206,7 @@ class TaskListener(TaskConfig):
                 self.name = next((f for f in files if f != 'yt-dlp-thumb'), files[0])
                 up_path = ospath.join(self.dir, self.name)
             except Exception as e:
-                await self.onUploadError(f"Cannot find file: {e}")
+                await self.onUploadError(f"Cannot find downloaded file: {e}")
                 return
 
         await self.reName()
@@ -323,15 +343,16 @@ class TaskListener(TaskConfig):
         await start_from_queued()
 
     async def proceedSplit(self, up_dir, m_size, o_files, size, gid):
+        """Split large files for Telegram upload."""
         if not self.isLeech or not await aiopath.isdir(up_dir):
             return True
 
-        target_min_bytes = 1_931_069_952
-        target_max_bytes = 2_028_896_563
-        telegram_limit = 2_097_152_000
+        target_min_bytes = 1_931_069_952  # ~1.8 GB
+        target_max_bytes = 2_028_896_563  # ~1.89 GB
+        telegram_limit = 2_097_152_000   # 2 GB
 
         for dirpath, _, files in await sync_to_async(walk, up_dir):
-            for file_ in files:
+            for file_ in sorted(files):  # Sort for consistency
                 input_file = ospath.join(dirpath, file_)
                 if not await aiopath.exists(input_file) or file_.endswith(('.aria2', '.!qB')):
                     continue
@@ -344,7 +365,7 @@ class TaskListener(TaskConfig):
 
                 video_info = get_video_info(input_file)
                 if not video_info:
-                    await self.onUploadError("Failed to get video info.")
+                    await self.onUploadError(f"Failed to get video info for {file_}.")
                     return False
 
                 num_parts = math.ceil(file_size / target_max_bytes)
@@ -360,26 +381,26 @@ class TaskListener(TaskConfig):
                     if not is_last_part:
                         split_duration, split_size = smart_guess_split(input_file, start_time, target_min_bytes, target_max_bytes, video_info['duration'])
                         if split_duration is None:
-                            await self.onUploadError(f"Failed to split part {part_num}.")
+                            await self.onUploadError(f"Failed to split part {part_num} of {file_}.")
                             return False
                         cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-t', str(split_duration), '-c', 'copy', part_file]
                         try:
                             subprocess.run(cmd, capture_output=True, text=True, check=True)
                             part_size = get_file_size(part_file)
                             if not (target_min_bytes <= part_size <= target_max_bytes):
-                                await self.onUploadError(f"Part {part_num} size out of range.")
+                                await self.onUploadError(f"Part {part_num} size {part_size} out of range for {file_}.")
                                 return False
                             parts.append(part_file)
                             start_time += split_duration
                         except subprocess.CalledProcessError as e:
-                            logger.error(f"Split error: {e}")
+                            logger.error(f"Split error for {file_}: {e}")
                             return False
                     else:
                         cmd = ['ffmpeg', '-y', '-i', input_file, '-ss', str(start_time), '-c', 'copy', part_file]
                         subprocess.run(cmd, capture_output=True, text=True, check=True)
                         part_size = get_file_size(part_file)
                         if part_size > telegram_limit:
-                            await self.onUploadError(f"Last part exceeds Telegram limit.")
+                            await self.onUploadError(f"Last part {part_size} exceeds Telegram limit for {file_}.")
                             return False
                         parts.append(part_file)
 
@@ -391,6 +412,7 @@ class TaskListener(TaskConfig):
         return True
 
     async def onUploadComplete(self, link, size, files, folders, mime_type, rclonePath='', dir_id=''):
+        """Handle upload completion."""
         if self.isSuperChat and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             await DbManager().rm_complete_task(self.message.link)
 
@@ -415,7 +437,8 @@ class TaskListener(TaskConfig):
         await start_from_queued()
 
     async def onDownloadError(self, error):
-        LOGGER.error(f"Download error: {error}")
+        """Handle download errors."""
+        LOGGER.error(f"Download error for MID {self.mid}: {error}")
         async with task_dict_lock:
             task_dict.pop(self.mid, None)
         await self.clean()
@@ -426,7 +449,8 @@ class TaskListener(TaskConfig):
         await start_from_queued()
 
     async def onUploadError(self, error):
-        LOGGER.error(f"Upload error: {error}")
+        """Handle upload errors."""
+        LOGGER.error(f"Upload error for MID {self.mid}: {error}")
         async with task_dict_lock:
             task_dict.pop(self.mid, None)
         await self.clean()
@@ -437,27 +461,53 @@ class TaskListener(TaskConfig):
         await start_from_queued()
 
     async def proceedExtract(self, up_path, size, gid):
+        """Extract archived files if applicable."""
         LOGGER.info(f"Extracting {up_path}")
-        return up_path
+        if not await aiopath.exists(up_path):
+            await self.onUploadError(f"File to extract not found: {up_path}")
+            return None
+        # Placeholder for extraction logic (e.g., using 7z or unzip)
+        # Example: subprocess.run(['7z', 'x', up_path, f'-o{self.dir}'])
+        try:
+            extracted_dir = ospath.join(self.dir, "extracted")
+            await makedirs(extracted_dir, exist_ok=True)
+            subprocess.run(['7z', 'x', up_path, f'-o{extracted_dir}'], check=True, capture_output=True, text=True)
+            await aioremove(up_path)  # Remove original archive
+            return extracted_dir
+        except subprocess.CalledProcessError as e:
+            LOGGER.error(f"Extraction failed for {up_path}: {e}")
+            await self.onUploadError(f"Extraction failed: {e}")
+            return None
 
     async def generateSampleVideo(self, up_path, gid):
+        """Generate a sample video clip."""
         LOGGER.info(f"Generating sample for {up_path}")
+        if not await aiopath.exists(up_path):
+            await self.onUploadError(f"Video file not found: {up_path}")
+            return None
         sample_path = ospath.join(self.dir, f"sample_{ospath.basename(up_path)}")
         cmd = ['ffmpeg', '-i', up_path, '-t', '60', '-c', 'copy', sample_path, '-y']
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
             return sample_path
         except subprocess.CalledProcessError as e:
-            LOGGER.error(f"Sample generation failed: {e}")
+            LOGGER.error(f"Sample generation failed for {up_path}: {e}")
+            await self.onUploadError(f"Sample generation failed: {e}")
             return None
 
     async def proceedCompress(self, up_path, size, gid):
+        """Compress video file."""
         LOGGER.info(f"Compressing {up_path}")
+        if not await aiopath.exists(up_path):
+            await self.onUploadError(f"Video file not found: {up_path}")
+            return None
         compressed_path = ospath.join(self.dir, f"compressed_{ospath.basename(up_path)}")
         cmd = ['ffmpeg', '-i', up_path, '-vf', 'scale=1280:720', '-crf', '28', compressed_path, '-y']
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
+            await aioremove(up_path)  # Remove original file
             return compressed_path
         except subprocess.CalledProcessError as e:
-            LOGGER.error(f"Compression failed: {e}")
+            LOGGER.error(f"Compression failed for {up_path}: {e}")
+            await self.onUploadError(f"Compression failed: {e}")
             return None
